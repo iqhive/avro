@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/iskorotkov/avro/v2/registry"
+	"github.com/iqhive/avro/v2/registry"
 )
 
 func Example() {

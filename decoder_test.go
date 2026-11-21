@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/iskorotkov/avro/v2"
+	"github.com/iqhive/avro/v2"
 	"github.com/stretchr/testify/assert"
 )
 

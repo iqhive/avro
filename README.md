@@ -4,16 +4,22 @@
   <img alt="Logo" src="http://svg.wiersma.co.za/hamba/project?title=avro&tag=A%20fast%20Go%20avro%20codec">
 </picture>
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/iskorotkov/avro/v2)](https://goreportcard.com/report/github.com/iskorotkov/avro/v2)
-[![Build Status](https://github.com/iskorotkov/avro/actions/workflows/test.yml/badge.svg)](https://github.com/iskorotkov/avro/actions)
-[![Coverage Status](https://coveralls.io/repos/github/iskorotkov/avro/badge.svg?branch=main)](https://coveralls.io/github/iskorotkov/avro?branch=main)
-[![Go Reference](https://pkg.go.dev/badge/github.com/iskorotkov/avro/v2.svg)](https://pkg.go.dev/github.com/iskorotkov/avro/v2)
-[![GitHub release](https://img.shields.io/github/release/iskorotkov/avro.svg)](https://github.com/iskorotkov/avro/releases)
-[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/iskorotkov/avro/master/LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/iqhive/avro/v2)](https://goreportcard.com/report/github.com/iqhive/avro/v2)
+[![Build Status](https://github.com/iqhive/avro/actions/workflows/test.yml/badge.svg)](https://github.com/iqhive/avro/actions)
+[![Go Reference](https://pkg.go.dev/badge/github.com/iqhive/avro/v2.svg)](https://pkg.go.dev/github.com/iqhive/avro/v2)
+[![GitHub release](https://img.shields.io/github/release/iqhive/avro.svg)](https://github.com/iqhive/avro/releases)
+[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/iqhive/avro/blob/main/LICENCE)
 
 A fast Go avro codec
 
 ---
+
+## iqhive/avro
+
+This is iqhive's fork of [hamba/avro](https://github.com/hamba/avro), which was archived in January 2026. It carries every change made in [iskorotkov/avro](https://github.com/iskorotkov/avro), the most active maintained fork, plus fixes of its own.
+
+- The module path is `github.com/iqhive/avro/v2`. Moving from hamba/avro or iskorotkov/avro means changing the import paths.
+- iskorotkov/avro's main branch is merged into this repository's `iskorotkov` branch every day. Once a week, what that branch brings in is tested and reviewed, and merged into `main` when the review finds no new bugs or security issues.
 
 ## Why this fork?
 
@@ -45,7 +51,7 @@ You have 2 options:
 Install with:
 
 ```shell
-go get github.com/iskorotkov/avro/v2
+go get github.com/iqhive/avro/v2
 ```
 
 **Note:** This project has renamed the default branch from `master` to `main`. You will need to update your local environment.
@@ -91,7 +97,7 @@ fmt.Println(out)
 // Outputs: {27 foo}
 ```
 
-More examples in the [godoc](https://pkg.go.dev/github.com/iskorotkov/avro/v2).
+More examples in the [godoc](https://pkg.go.dev/github.com/iqhive/avro/v2).
 
 ### Types Conversions
 
@@ -275,7 +281,7 @@ You can use the avrogen command line tool to generate the structs, or use it as 
 Install the struct generator with:
 
 ```shell
-go install github.com/iskorotkov/avro/v2/cmd/avrogen@<version>
+go install github.com/iqhive/avro/v2/cmd/avrogen@<version>
 ```
 
 Example usage assuming there's a valid schema in `in.avsc`:
@@ -335,7 +341,7 @@ schemas to the console. It can be used in CI/CD pipelines to validate schema cha
 Install the Avro schema validator with:
 
 ```shell
-go install github.com/iskorotkov/avro/v2/cmd/avrosv@<version>
+go install github.com/iqhive/avro/v2/cmd/avrosv@<version>
 ```
 
 Example usage assuming there's a valid schema in `in.avsc` (exit status code is `0`):

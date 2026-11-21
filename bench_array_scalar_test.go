@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/iskorotkov/avro/v2"
+	"github.com/iqhive/avro/v2"
 )
 
 func benchScalarArrayDecode[T any](b *testing.B, schemaStr string, gen func(int) T) {

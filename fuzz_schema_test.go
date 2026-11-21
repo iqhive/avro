@@ -3,7 +3,7 @@ package avro_test
 import (
 	"testing"
 
-	"github.com/iskorotkov/avro/v2"
+	"github.com/iqhive/avro/v2"
 )
 
 func FuzzSchemaParse(f *testing.F) {

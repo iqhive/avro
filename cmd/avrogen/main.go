@@ -12,9 +12,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/iskorotkov/avro/v2"
-	"github.com/iskorotkov/avro/v2/gen"
-	"github.com/iskorotkov/avro/v2/registry"
+	"github.com/iqhive/avro/v2"
+	"github.com/iqhive/avro/v2/gen"
+	"github.com/iqhive/avro/v2/registry"
 	"golang.org/x/tools/imports"
 )
 

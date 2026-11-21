@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/iskorotkov/avro/v2"
-	"github.com/iskorotkov/avro/v2/soe"
+	"github.com/iqhive/avro/v2"
+	"github.com/iqhive/avro/v2/soe"
 )
 
 // MemorySchemaStore is a basic in-memory schema store and resolver

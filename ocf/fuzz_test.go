@@ -6,8 +6,8 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/iskorotkov/avro/v2"
-	"github.com/iskorotkov/avro/v2/ocf"
+	"github.com/iqhive/avro/v2"
+	"github.com/iqhive/avro/v2/ocf"
 	"github.com/klauspost/compress/zstd"
 )
 

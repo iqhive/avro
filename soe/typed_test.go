@@ -4,8 +4,8 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/iskorotkov/avro/v2/soe"
-	"github.com/iskorotkov/avro/v2/soe/internal/testdata"
+	"github.com/iqhive/avro/v2/soe"
+	"github.com/iqhive/avro/v2/soe/internal/testdata"
 	"github.com/stretchr/testify/require"
 )
 

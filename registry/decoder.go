@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/iskorotkov/avro/v2"
+	"github.com/iqhive/avro/v2"
 )
 
 // DecoderFunc is a function used to customize the Decoder.

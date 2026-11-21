@@ -1,4 +1,4 @@
-module github.com/iskorotkov/avro/v2
+module github.com/iqhive/avro/v2
 
 go 1.26.0
 
