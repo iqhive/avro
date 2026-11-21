@@ -45,27 +45,6 @@ jobs:
           paths: "tests.xml"
         if: always()
 
-      - name: Coveralls
-        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          files: coverage.out
-          format: golang
-          parallel: true
-          flag-name: go-${{ matrix.go-version }}
-
-  finish:
-    needs: test
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Coveralls Finished
-        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          parallel-finished: true
-
   test-386:
     runs-on: ubuntu-latest
     env:

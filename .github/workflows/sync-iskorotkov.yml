@@ -1,0 +1,57 @@
+# Merges iskorotkov/avro's main into this repository's iskorotkov branch once
+# a day, with .github/scripts/sync-iskorotkov.sh (which renames the module
+# path and keeps this repository's .github). The weekly review in the private
+# iqhive/avro-ci repository tests and reviews what the branch brings in, and
+# merges it into main when it finds no new bugs or security issues.
+#
+# Nothing from upstream is built or run here: the job only fetches and merges.
+on:
+  schedule:
+    - cron: "23 15 * * *"
+  workflow_dispatch:
+
+name: sync iskorotkov
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-iskorotkov
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge iskorotkov/avro main into the iskorotkov branch
+        run: |
+          set -euo pipefail
+          # Run the script from main, whatever the iskorotkov branch holds.
+          script="$RUNNER_TEMP/sync-iskorotkov.sh"
+          cp .github/scripts/sync-iskorotkov.sh "$script"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -q -C iskorotkov origin/iskorotkov
+          git fetch -q --no-tags https://github.com/iskorotkov/avro.git main
+          bash "$script" FETCH_HEAD
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/iskorotkov)" ]; then
+            git push -q origin iskorotkov
+          fi
+
+      - name: Check that main and the iskorotkov branch still merge
+        run: |
+          set -euo pipefail
+          if ! out=$(git merge-tree --write-tree --name-only origin/main iskorotkov); then
+            echo "::error::main and the iskorotkov branch conflict; the weekly merge will fail until this is resolved by hand"
+            sed -n '2,/^$/p' <<<"$out"
+            exit 1
+          fi

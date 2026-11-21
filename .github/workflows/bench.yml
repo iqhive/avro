@@ -11,7 +11,6 @@ name: bench
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: bench-${{ github.ref }}
@@ -20,6 +19,9 @@ concurrency:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     timeout-minutes: 30
     env:
       GO_VERSION: "1.26"
