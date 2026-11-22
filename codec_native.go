@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -310,7 +311,7 @@ func createEncoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValEncode
 			return &timestampMicrosCodec{local: true}
 		case isTime && st == Long && lt == LocalTimestampNanos:
 			return &timestampNanosCodec{local: true}
-		case typ.Type1().ConvertibleTo(ratType) && st != Bytes || lt == Decimal:
+		case typ.Type1().ConvertibleTo(ratType) && st == Bytes && lt == Decimal:
 			ls := getLogicalSchema(schema)
 			dec := ls.(*DecimalLogicalSchema)
 			return &bytesDecimalCodec{prec: dec.Precision(), scale: dec.Scale()}
@@ -375,14 +376,48 @@ type smallInt interface {
 	~int | ~int8 | ~int16 | ~int32 | ~uint | ~uint8 | ~uint16
 }
 
+// fits reports whether v survives conversion to T: the same value with the
+// same sign. Decoding a value that does not fit the Go type is an error, not
+// a wrapped value.
+func fits[T smallInt | largeInt](v int64) bool {
+	t := T(v)
+	return int64(t) == v && (v < 0) == (t < 0)
+}
+
+// reportDoesNotFit records on r that the first of vs that does not fit T,
+// read to be stored as one, does not.
+func reportDoesNotFit[T smallInt | largeInt, V int32 | int64](r *Reader, vs ...V) {
+	for _, v := range vs {
+		if !fits[T](int64(v)) {
+			r.ReportError("decode", fmt.Sprintf("%d does not fit %T", v, T(0)))
+			return
+		}
+	}
+}
+
+// fitsInt reports whether v, a Go integer, fits an Avro int.
+func fitsInt[T smallInt](v T) bool {
+	return int64(int32(v)) == int64(v) && (int32(v) < 0) == (v < 0)
+}
+
 type intCodec[T smallInt] struct{}
 
 func (*intCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
-	*(*T)(ptr) = T(r.ReadInt())
+	v := r.ReadInt()
+	if !fits[T](int64(v)) {
+		reportDoesNotFit[T](r, v)
+		return
+	}
+	*(*T)(ptr) = T(v)
 }
 
 func (*intCodec[T]) Encode(ptr unsafe.Pointer, w *Writer) {
-	w.WriteInt(int32(*(*T)(ptr)))
+	v := *(*T)(ptr)
+	if !fitsInt(v) {
+		w.Error = fmt.Errorf("avro: %d does not fit an Avro int", v)
+		return
+	}
+	w.WriteInt(int32(v))
 }
 
 type largeInt interface {
@@ -392,7 +427,12 @@ type largeInt interface {
 type longCodec[T largeInt] struct{}
 
 func (c *longCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
-	*(*T)(ptr) = T(r.ReadLong())
+	v := r.ReadLong()
+	if !fits[T](v) {
+		reportDoesNotFit[T](r, v)
+		return
+	}
+	*(*T)(ptr) = T(v)
 }
 
 func (*longCodec[T]) Encode(ptr unsafe.Pointer, w *Writer) {
@@ -404,7 +444,12 @@ type longConvCodec[T largeInt] struct {
 }
 
 func (c *longConvCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
-	*(*T)(ptr) = T(c.convert(r))
+	v := c.convert(r)
+	if !fits[T](v) {
+		reportDoesNotFit[T](r, v)
+		return
+	}
+	*(*T)(ptr) = T(v)
 }
 
 type float32Codec struct{}
@@ -482,7 +527,14 @@ func (c *dateCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 
 func (c *dateCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	t := *(*time.Time)(ptr)
-	days := t.Unix() / int64(24*time.Hour/time.Second)
+	// The day is the floor of the seconds over a day's: division truncates
+	// toward zero, which for a time of day before 1970 gives the next day.
+	const day = int64(24 * time.Hour / time.Second)
+	sec := t.Unix()
+	days := sec / day
+	if sec%day < 0 {
+		days--
+	}
 	w.WriteInt(int32(days))
 }
 
@@ -698,12 +750,18 @@ type bytesDecimalCodec struct {
 	scale int
 }
 
+// Decode decodes into a big.Rat value (bytesDecimalPtrCodec is the one for a
+// *big.Rat): it sets the value, rather than storing a pointer over it.
 func (c *bytesDecimalCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	b := r.ReadBytes()
-	if i := (&big.Int{}).SetBytes(b); len(b) > 0 && b[0]&0x80 > 0 {
-		i.Sub(i, new(big.Int).Lsh(one, uint(len(b))*8))
-	}
-	*(**big.Rat)(ptr) = ratFromBytes(b, c.scale)
+	(*big.Rat)(ptr).Set(ratFromBytes(b, c.scale))
+}
+
+// unscaled returns r times 10^scale, truncated toward zero, as positive
+// values always were: big.Int's Div rounds a negative value away from zero.
+func unscaled(r *big.Rat, scale int) *big.Int {
+	i := new(big.Int).Mul(r.Num(), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
+	return i.Quo(i, r.Denom())
 }
 
 func ratFromBytes(b []byte, scale int) *big.Rat {
@@ -717,9 +775,7 @@ func ratFromBytes(b []byte, scale int) *big.Rat {
 
 func (c *bytesDecimalCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	r := (*big.Rat)(ptr)
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(c.scale)), nil)
-	i := (&big.Int{}).Mul(r.Num(), scale)
-	i = i.Div(i, r.Denom())
+	i := unscaled(r, c.scale)
 
 	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
 		w.Error = fmt.Errorf(
@@ -764,9 +820,11 @@ func (c *bytesDecimalPtrCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 
 func (c *bytesDecimalPtrCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	r := *(**big.Rat)(ptr)
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(c.scale)), nil)
-	i := (&big.Int{}).Mul(r.Num(), scale)
-	i = i.Div(i, r.Denom())
+	if r == nil {
+		w.Error = errors.New("avro: cannot encode a nil *big.Rat as Avro bytes.decimal")
+		return
+	}
+	i := unscaled(r, c.scale)
 
 	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
 		w.Error = fmt.Errorf(

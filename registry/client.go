@@ -174,6 +174,16 @@ type Client struct {
 	cache sync.Map // map[int]avro.Schema
 }
 
+// pathSegment escapes a subject as one segment of a request path. Joined
+// unescaped, a "/", "?" or "#" in it, or a ".." that a URL takes for a step
+// up, sent the request to another endpoint.
+func pathSegment(s string) string {
+	if s == "." || s == ".." {
+		return strings.ReplaceAll(s, ".", "%2E")
+	}
+	return url.PathEscape(s)
+}
+
 // NewClient creates a schema registry Client with the given base url.
 func NewClient(baseURL string, opts ...ClientFunc) (*Client, error) {
 	u, err := url.Parse(baseURL)
@@ -233,7 +243,7 @@ func (c *Client) GetSubjects(ctx context.Context) ([]string, error) {
 // DeleteSubject delete subject.
 func (c *Client) DeleteSubject(ctx context.Context, subject string) ([]int, error) {
 	var versions []int
-	p := path.Join("subjects", subject)
+	p := "subjects/" + pathSegment(subject)
 	if err := c.request(ctx, http.MethodDelete, p, nil, &versions); err != nil {
 		return nil, err
 	}
@@ -244,7 +254,7 @@ func (c *Client) DeleteSubject(ctx context.Context, subject string) ([]int, erro
 // GetVersions gets the schema versions for a subject.
 func (c *Client) GetVersions(ctx context.Context, subject string) ([]int, error) {
 	var versions []int
-	p := path.Join("subjects", subject, "versions")
+	p := "subjects/" + pathSegment(subject) + "/versions"
 	if err := c.request(ctx, http.MethodGet, p, nil, &versions); err != nil {
 		return nil, err
 	}
@@ -254,7 +264,7 @@ func (c *Client) GetVersions(ctx context.Context, subject string) ([]int, error)
 // GetSchemaByVersion gets the schema by version.
 func (c *Client) GetSchemaByVersion(ctx context.Context, subject string, version int) (avro.Schema, error) {
 	var resp schemaPayload
-	p := path.Join("subjects", subject, "versions", strconv.Itoa(version))
+	p := "subjects/" + pathSegment(subject) + "/versions/" + strconv.Itoa(version)
 	if err := c.request(ctx, http.MethodGet, p, nil, &resp); err != nil {
 		return nil, err
 	}
@@ -264,7 +274,7 @@ func (c *Client) GetSchemaByVersion(ctx context.Context, subject string, version
 // GetLatestSchema gets the latest schema for a subject.
 func (c *Client) GetLatestSchema(ctx context.Context, subject string) (avro.Schema, error) {
 	var resp schemaPayload
-	p := path.Join("subjects", subject, "versions", "latest")
+	p := "subjects/" + pathSegment(subject) + "/versions/latest"
 	if err := c.request(ctx, http.MethodGet, p, nil, &resp); err != nil {
 		return nil, err
 	}
@@ -274,7 +284,7 @@ func (c *Client) GetLatestSchema(ctx context.Context, subject string) (avro.Sche
 // GetSchemaInfo gets the schema and schema metadata for a subject and version.
 func (c *Client) GetSchemaInfo(ctx context.Context, subject string, version int) (SchemaInfo, error) {
 	var resp schemaInfoPayload
-	p := path.Join("subjects", subject, "versions", strconv.Itoa(version))
+	p := "subjects/" + pathSegment(subject) + "/versions/" + strconv.Itoa(version)
 	if err := c.request(ctx, http.MethodGet, p, nil, &resp); err != nil {
 		return SchemaInfo{}, err
 	}
@@ -284,7 +294,7 @@ func (c *Client) GetSchemaInfo(ctx context.Context, subject string, version int)
 // GetLatestSchemaInfo gets the latest schema and schema metadata for a subject.
 func (c *Client) GetLatestSchemaInfo(ctx context.Context, subject string) (SchemaInfo, error) {
 	var resp schemaInfoPayload
-	p := path.Join("subjects", subject, "versions", "latest")
+	p := "subjects/" + pathSegment(subject) + "/versions/latest"
 	if err := c.request(ctx, http.MethodGet, p, nil, &resp); err != nil {
 		return SchemaInfo{}, err
 	}
@@ -299,7 +309,7 @@ func (c *Client) CreateSchema(
 ) (int, avro.Schema, error) {
 	var resp idPayload
 	req := schemaPayload{Schema: schema, References: references}
-	p := path.Join("subjects", subject, "versions")
+	p := "subjects/" + pathSegment(subject) + "/versions"
 	if err := c.request(ctx, http.MethodPost, p, req, &resp); err != nil {
 		return 0, nil, err
 	}
@@ -321,7 +331,7 @@ func (c *Client) IsRegisteredWithRefs(
 ) (int, avro.Schema, error) {
 	var resp idPayload
 	req := schemaPayload{Schema: schema, References: references}
-	if err := c.request(ctx, http.MethodPost, path.Join("subjects", subject), req, &resp); err != nil {
+	if err := c.request(ctx, http.MethodPost, "subjects/"+pathSegment(subject), req, &resp); err != nil {
 		return 0, nil, err
 	}
 
@@ -347,7 +357,7 @@ func (c *Client) IsCompatibleWithRefs(
 	references ...SchemaReference,
 ) (bool, error) {
 	req := schemaPayload{Schema: schema, References: references}
-	reqPath := path.Join("compatibility", "subjects", subject, "versions")
+	reqPath := "compatibility/subjects/" + pathSegment(subject) + "/versions"
 	var resp isCompatibleResponse
 	if err := c.request(ctx, http.MethodPost, reqPath, req, &resp); err != nil {
 		return false, err
@@ -396,7 +406,7 @@ func (c *Client) SetCompatibilityLevel(ctx context.Context, subject, lvl string)
 	}
 
 	req := compatPayload{Compatibility: lvl}
-	return c.request(ctx, http.MethodPut, path.Join("config", subject), req, nil)
+	return c.request(ctx, http.MethodPut, "config/"+pathSegment(subject), req, nil)
 }
 
 // GetGlobalCompatibilityLevel gets the global compatibility level.
@@ -411,7 +421,7 @@ func (c *Client) GetGlobalCompatibilityLevel(ctx context.Context) (string, error
 // GetCompatibilityLevel gets the compatibility level of a subject.
 func (c *Client) GetCompatibilityLevel(ctx context.Context, subject string) (string, error) {
 	var resp compatPayload
-	if err := c.request(ctx, http.MethodGet, path.Join("config", subject), nil, &resp); err != nil {
+	if err := c.request(ctx, http.MethodGet, "config/"+pathSegment(subject), nil, &resp); err != nil {
 		return "", err
 	}
 	return resp.Compatibility, nil

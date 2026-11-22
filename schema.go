@@ -352,7 +352,8 @@ func (i *cacheFingerprinter) CacheFingerprint(schema Schema, fn func() []byte) [
 
 	fp := schema.Fingerprint()
 	refs := externalRefsIdentity(schema)
-	if i.writerFingerprint == nil && len(refs) == 0 {
+	defs := defaultsIdentity(schema)
+	if i.writerFingerprint == nil && len(refs) == 0 && len(defs) == 0 {
 		i.cache.Store(fp)
 		return fp
 	}
@@ -360,6 +361,7 @@ func (i *cacheFingerprinter) CacheFingerprint(schema Schema, fn func() []byte) [
 	h := sha256.New()
 	_, _ = h.Write(fp[:])
 	_, _ = h.Write(refs)
+	_, _ = h.Write(defs)
 	if i.writerFingerprint != nil {
 		_, _ = h.Write(i.writerFingerprint[:])
 		if fn != nil {

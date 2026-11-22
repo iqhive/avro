@@ -546,7 +546,11 @@ func newDecimalLogicalType(size, prec, scale int) LogicalSchema {
 	}
 
 	if size > 0 {
-		maxPrecision := int(math.Floor(math.Log10(math.Pow(2, 8*float64(size)) - 1)))
+		// The most digits a signed size-byte value holds: floor(log10(2^(8n-1)
+		// - 1)), worked out as the specification and the Java implementation
+		// do. 2^(8n) - 1, an unsigned range, allowed a digit too many for some
+		// sizes, and math.Pow overflows to infinity from 128 bytes up.
+		maxPrecision := int(math.Floor(math.Log10(2) * float64(8*size-1)))
 		if prec > maxPrecision {
 			return nil
 		}

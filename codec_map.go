@@ -75,7 +75,7 @@ func (d *mapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		size += l
 
 		if isNil {
-			d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(l))
+			d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(mapHint(l)))
 			isNil = false
 		}
 
@@ -89,7 +89,9 @@ func (d *mapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 
 			d.decoder.Decode(elemPtr, r)
 			if r.Error != nil {
-				r.Error = fmt.Errorf("reading map[string]%s: %w", d.elemType.String(), r.Error)
+				if !isMaxDepth(r.Error) {
+					r.Error = fmt.Errorf("reading map[string]%s: %w", d.elemType.String(), r.Error)
+				}
 				return
 			}
 
@@ -101,9 +103,20 @@ func (d *mapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(0))
 	}
 
-	if r.Error != nil && !errors.Is(r.Error, io.EOF) {
+	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !isMaxDepth(r.Error) {
 		r.Error = fmt.Errorf("%v: %w", d.mapType, r.Error)
 	}
+}
+
+// maxMapHint is the largest size hint a map decoder gives a new map.
+const maxMapHint = 1024
+
+// mapHint returns the size hint for a new map whose first block claims l
+// entries. The hint is only an allocation, made before a single entry is read,
+// so it is capped: a block count from the data cannot make the decoder
+// allocate memory the data does not fill.
+func mapHint(l int) int {
+	return min(l, maxMapHint)
 }
 
 func decoderOfMapUnmarshaler(d *decoderContext, m *MapSchema, typ reflect2.Type) ValDecoder {
@@ -142,7 +155,7 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 		size += l
 
 		if isNil {
-			d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(l))
+			d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(mapHint(l)))
 			isNil = false
 		}
 
@@ -156,13 +169,25 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 				keyObj = d.keyType.UnsafeIndirect(keyPtr)
 			}
 			unmarshaler := keyObj.(encoding.TextUnmarshaler)
-			if err := unmarshaler.UnmarshalText(r.ReadBytes()); err != nil {
+			key := r.ReadBytes()
+			if r.Error != nil {
+				return
+			}
+			if err := unmarshaler.UnmarshalText(key); err != nil {
 				r.ReportError("mapDecoderUnmarshaler", err.Error())
 				return
 			}
 
 			elemPtr := d.elemType.UnsafeNew()
 			d.decoder.Decode(elemPtr, r)
+			// Stop at an error: the block count came from the data, and an
+			// exhausted input would otherwise be read that many times over.
+			if r.Error != nil {
+				if !isMaxDepth(r.Error) {
+					r.Error = fmt.Errorf("reading %s: %w", d.mapType, r.Error)
+				}
+				return
+			}
 
 			d.mapType.UnsafeSetIndex(ptr, keyPtr, elemPtr)
 		}
@@ -172,7 +197,7 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(0))
 	}
 
-	if r.Error != nil && !errors.Is(r.Error, io.EOF) {
+	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !isMaxDepth(r.Error) {
 		r.Error = fmt.Errorf("%v: %w", d.mapType, r.Error)
 	}
 }
@@ -202,7 +227,7 @@ func (e *mapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 	for {
 		wrote := w.WriteBlockCB(func(w *Writer) int64 {
 			var i int
-			for i = 0; iter.HasNext() && i < blockLength; i++ {
+			for i = 0; iter.HasNext() && i < blockLength && w.Error == nil; i++ {
 				keyPtr, elemPtr := iter.UnsafeNext()
 				w.WriteString(*(*string)(keyPtr))
 				e.encoder.Encode(elemPtr, w)
@@ -211,12 +236,12 @@ func (e *mapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 			return int64(i)
 		})
 
-		if wrote == 0 {
+		if wrote == 0 || w.Error != nil {
 			break
 		}
 	}
 
-	if w.Error != nil && !errors.Is(w.Error, io.EOF) {
+	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !isMaxDepth(w.Error) {
 		w.Error = fmt.Errorf("%v: %w", e.mapType, w.Error)
 	}
 }
@@ -248,7 +273,7 @@ func (e *mapEncoderMarshaller) Encode(ptr unsafe.Pointer, w *Writer) {
 	for {
 		wrote := w.WriteBlockCB(func(w *Writer) int64 {
 			var i int
-			for i = 0; iter.HasNext() && i < blockLength; i++ {
+			for i = 0; iter.HasNext() && i < blockLength && w.Error == nil; i++ {
 				keyPtr, elemPtr := iter.UnsafeNext()
 
 				obj := e.keyType.UnsafeIndirect(keyPtr)
@@ -270,12 +295,12 @@ func (e *mapEncoderMarshaller) Encode(ptr unsafe.Pointer, w *Writer) {
 			return int64(i)
 		})
 
-		if wrote == 0 {
+		if wrote == 0 || w.Error != nil {
 			break
 		}
 	}
 
-	if w.Error != nil && !errors.Is(w.Error, io.EOF) {
+	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !isMaxDepth(w.Error) {
 		w.Error = fmt.Errorf("%v: %w", e.mapType, w.Error)
 	}
 }
@@ -307,7 +332,7 @@ func (e *mapEncoderAppender) Encode(ptr unsafe.Pointer, w *Writer) {
 	for {
 		wrote := w.WriteBlockCB(func(w *Writer) int64 {
 			var i int
-			for i = 0; iter.HasNext() && i < blockLength; i++ {
+			for i = 0; iter.HasNext() && i < blockLength && w.Error == nil; i++ {
 				keyPtr, elemPtr := iter.UnsafeNext()
 
 				obj := e.keyType.UnsafeIndirect(keyPtr)
@@ -331,12 +356,12 @@ func (e *mapEncoderAppender) Encode(ptr unsafe.Pointer, w *Writer) {
 			return int64(i)
 		})
 
-		if wrote == 0 {
+		if wrote == 0 || w.Error != nil {
 			break
 		}
 	}
 
-	if w.Error != nil && !errors.Is(w.Error, io.EOF) {
+	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !isMaxDepth(w.Error) {
 		w.Error = fmt.Errorf("%v: %w", e.mapType, w.Error)
 	}
 }

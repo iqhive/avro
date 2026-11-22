@@ -11,6 +11,12 @@ import (
 const (
 	maxIntBufSize  = 5
 	maxLongBufSize = 10
+
+	// lastIntByte and lastLongByte are the largest values the last byte of
+	// an int or long varint can take: its bits past 32 or 64 would be lost,
+	// so a byte above them is a malformed value, not a different valid one.
+	lastIntByte  = 0x0f
+	lastLongByte = 0x01
 )
 
 // ReaderFunc is a function used to customize the Reader.
@@ -31,6 +37,7 @@ type Reader struct {
 	buf    []byte
 	head   int
 	tail   int
+	depth  int
 	Error  error
 }
 
@@ -53,7 +60,27 @@ func (r *Reader) Reset(b []byte) *Reader {
 	r.buf = b
 	r.head = 0
 	r.tail = len(b)
+	r.depth = 0
 	return r
+}
+
+// enter counts one more level of record nesting and reports whether it is
+// within Config.MaxDepth. Past it, it records errMaxDepth and the level is not
+// counted, so a caller that gets false must not call leave.
+func (r *Reader) enter() bool {
+	if r.depth >= r.cfg.getMaxDepth() {
+		if r.Error == nil {
+			r.Error = errMaxDepth
+		}
+		return false
+	}
+	r.depth++
+	return true
+}
+
+// leave ends a level that enter counted.
+func (r *Reader) leave() {
+	r.depth--
 }
 
 // ReportError record an error in iterator instance with current position.
@@ -90,6 +117,15 @@ func (r *Reader) loadMore() bool {
 		r.tail = n
 		return true
 	}
+}
+
+// cutShort turns the end of the input, met inside a value, into
+// io.ErrUnexpectedEOF: io.EOF means the input ended between values.
+func cutShort(err error) error {
+	if err == io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 func (r *Reader) readByte() byte {
@@ -169,6 +205,9 @@ func (r *Reader) ReadInt() int32 {
 		for i, b := range r.buf[r.head : r.head+maxIntBufSize] {
 			v |= uint32(b&0x7f) << s
 			if b&0x80 == 0 {
+				if i == maxIntBufSize-1 && b > lastIntByte {
+					break
+				}
 				r.head += i + 1
 				return int32((v >> 1) ^ -(v & 1))
 			}
@@ -196,6 +235,10 @@ func (r *Reader) ReadInt() int32 {
 		for _, b := range r.buf[r.head:tail] {
 			v |= uint32(b&0x7f) << s
 			if b&0x80 == 0 {
+				if n+i == maxIntBufSize-1 && b > lastIntByte {
+					r.ReportError("ReadInt", "int overflow")
+					return 0
+				}
 				r.head += i + 1
 				return int32((v >> 1) ^ -(v & 1))
 			}
@@ -212,7 +255,7 @@ func (r *Reader) ReadInt() int32 {
 		// We ran out of buffer and are not at the end of the int,
 		// Read more into the buffer.
 		if !r.loadMore() {
-			r.Error = fmt.Errorf("reading int: %w", r.Error)
+			r.Error = fmt.Errorf("reading int: %w", cutShort(r.Error))
 			return 0
 		}
 	}
@@ -233,6 +276,9 @@ func (r *Reader) ReadLong() int64 {
 		for i, b := range r.buf[r.head : r.head+maxLongBufSize] {
 			v |= uint64(b&0x7f) << s
 			if b&0x80 == 0 {
+				if i == maxLongBufSize-1 && b > lastLongByte {
+					break
+				}
 				r.head += i + 1
 				return int64((v >> 1) ^ -(v & 1))
 			}
@@ -260,6 +306,10 @@ func (r *Reader) ReadLong() int64 {
 		for _, b := range r.buf[r.head:tail] {
 			v |= uint64(b&0x7f) << s
 			if b&0x80 == 0 {
+				if n+i == maxLongBufSize-1 && b > lastLongByte {
+					r.ReportError("ReadLong", "int overflow")
+					return 0
+				}
 				r.head += i + 1
 				return int64((v >> 1) ^ -(v & 1))
 			}
@@ -276,7 +326,7 @@ func (r *Reader) ReadLong() int64 {
 		// We ran out of buffer and are not at the end of the long,
 		// Read more into the buffer.
 		if !r.loadMore() {
-			r.Error = fmt.Errorf("reading long: %w", r.Error)
+			r.Error = fmt.Errorf("reading long: %w", cutShort(r.Error))
 			return 0
 		}
 	}
@@ -329,7 +379,10 @@ func (r *Reader) readBytes(fnName, op string) []byte {
 
 		_ = r.slab[size-1] // Bounds check hint to compiler.
 
-		dst := r.slab[:size]
+		// The slice is capped at its own length: with the rest of the slab as
+		// spare capacity, appending to it would overwrite the values read after
+		// it, strings among them.
+		dst := r.slab[:size:size]
 		r.slab = r.slab[size:]
 		copy(dst, r.buf[r.head:r.head+size])
 		r.head += size

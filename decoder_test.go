@@ -74,9 +74,10 @@ func TestUnmarshal(t *testing.T) {
 	schema := avro.MustParse("int")
 
 	var i int
-	err := avro.Unmarshal(schema, []byte{0xE2}, &i)
+	err := avro.Unmarshal(schema, []byte{0x36}, &i)
 
 	assert.NoError(t, err)
+	assert.Equal(t, 27, i)
 }
 
 func TestUnmarshal_Ptr(t *testing.T) {

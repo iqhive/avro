@@ -292,5 +292,6 @@ func TestReader_ReadNextUnionIndexOutOfRange(t *testing.T) {
 	got := r.ReadNext(schema)
 
 	assert.Nil(t, got)
-	require.ErrorContains(t, r.Error, "unknown union type")
+	// The branch is an int, and 1<<32 does not fit one.
+	require.ErrorContains(t, r.Error, "int overflow")
 }

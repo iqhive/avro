@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -16,6 +17,17 @@ var (
 	ratType          = reflect.TypeFor[big.Rat]()
 	durType          = reflect.TypeFor[LogicalDuration]()
 )
+
+// errMaxDepth is the error for records nested deeper than Config.MaxDepth.
+// Decoders and encoders return it as it is, without the context they add to
+// other errors on the way out: adding to it at each of thousands of levels
+// would take memory in proportion to the square of the depth.
+var errMaxDepth = errors.New("avro: records are nested deeper than Config.MaxDepth")
+
+// isMaxDepth reports whether err is errMaxDepth, which gets no context.
+func isMaxDepth(err error) bool {
+	return errors.Is(err, errMaxDepth)
+}
 
 type null struct{}
 
@@ -35,6 +47,10 @@ type ValEncoder interface {
 
 // ReadVal parses Avro value and stores the result in the value pointed to by obj.
 func (r *Reader) ReadVal(schema Schema, obj any) {
+	if obj == nil {
+		r.ReportError("ReadVal", "can not read into nil")
+		return
+	}
 	decoder := r.cfg.getDecoderFromCache(schema.CacheFingerprint(), reflect2.RTypeOf(obj))
 	if decoder == nil {
 		typ := reflect2.TypeOf(obj)

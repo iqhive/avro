@@ -2,6 +2,7 @@ package avro
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -96,18 +97,18 @@ func createEncoderOfFixed(fixed *FixedSchema, typ reflect2.Type) ValEncoder {
 	}
 }
 
-type fixedUint64Codec [8]byte
+// fixedUint64Codec keeps no buffer of its own: one codec serves every
+// goroutine that uses it.
+type fixedUint64Codec struct{}
 
 func (c *fixedUint64Codec) Decode(ptr unsafe.Pointer, r *Reader) {
-	buffer := c[:]
-	r.Read(buffer)
-	*(*uint64)(ptr) = binary.BigEndian.Uint64(buffer)
+	var buffer [8]byte
+	r.Read(buffer[:])
+	*(*uint64)(ptr) = binary.BigEndian.Uint64(buffer[:])
 }
 
 func (c *fixedUint64Codec) Encode(ptr unsafe.Pointer, w *Writer) {
-	buffer := c[:]
-	binary.BigEndian.PutUint64(buffer, *(*uint64)(ptr))
-	_, _ = w.Write(buffer)
+	w.buf = binary.BigEndian.AppendUint64(w.buf, *(*uint64)(ptr))
 }
 
 type fixedCodec struct {
@@ -141,9 +142,11 @@ func (c *fixedDecimalCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 
 func (c *fixedDecimalCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	r := *(**big.Rat)(ptr)
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(c.scale)), nil)
-	i := (&big.Int{}).Mul(r.Num(), scale)
-	i = i.Div(i, r.Denom())
+	if r == nil {
+		w.Error = errors.New("avro: cannot encode a nil *big.Rat as Avro fixed.decimal")
+		return
+	}
+	i := unscaled(r, c.scale)
 
 	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
 		w.Error = fmt.Errorf(
@@ -172,7 +175,13 @@ func (c *fixedDecimalCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 		}
 
 	case -1:
-		b = i.Add(i, (&big.Int{}).Lsh(one, uint(c.size*8))).Bytes()
+		// Two's complement in size bytes, which only holds the value if the
+		// top bit comes out set: otherwise the bytes read back as a positive
+		// number.
+		twos := new(big.Int).Add(i, new(big.Int).Lsh(one, uint(c.size*8)))
+		if twos.Sign() > 0 && twos.BitLen() == c.size*8 {
+			b = twos.Bytes()
+		}
 	}
 
 	if len(b) != c.size {

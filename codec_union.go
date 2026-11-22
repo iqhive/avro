@@ -33,7 +33,7 @@ func createDecoderOfUnion(d *decoderContext, schema *UnionSchema, typ reflect2.T
 		}
 		return decoderOfNullableUnion(d, schema, typ)
 	case reflect.Pointer:
-		if typ.Implements(reflect2.Type2(reflect.TypeFor[UnionConverter]())) {
+		if typ.Implements(unionConverterType) {
 			return decoderOfUnionConverterCodec(d, schema, typ)
 		}
 
@@ -50,11 +50,22 @@ func createDecoderOfUnion(d *decoderContext, schema *UnionSchema, typ reflect2.T
 			return dec
 		}
 	case reflect.Struct:
-		return createDecoderOfUnion(d, schema, reflect2.PtrTo(typ))
+		// A struct held by value is decoded in place. It must not go through
+		// a decoder for *T, which would take the struct's first word for the
+		// pointer.
+		if reflect2.PtrTo(typ).Implements(unionConverterType) {
+			return decoderOfUnionConverterCodec(d, schema, typ)
+		}
+		if !schema.Nullable() {
+			break
+		}
+		return decoderOfNullableUnion(d, schema, typ)
 	}
 
 	return &errorDecoder{err: fmt.Errorf("avro: %s is unsupported for Avro %s", typ.String(), schema.Type())}
 }
+
+var unionConverterType = reflect2.Type2(reflect.TypeFor[UnionConverter]())
 
 func createEncoderOfUnion(e *encoderContext, schema *UnionSchema, typ reflect2.Type) ValEncoder {
 	switch typ.Kind() {
@@ -70,7 +81,7 @@ func createEncoderOfUnion(e *encoderContext, schema *UnionSchema, typ reflect2.T
 		}
 		return encoderOfNullableUnion(e, schema, typ)
 	case reflect.Pointer:
-		if typ.Implements(reflect2.Type2(reflect.TypeFor[UnionConverter]())) {
+		if typ.Implements(unionConverterType) {
 			return encoderOfUnionConverterCodec(e, schema, typ)
 		}
 
@@ -117,14 +128,13 @@ func (d *mapUnionDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		return
 	}
 
-	// In a null case, just return
+	// The map names the one branch decoded, so it starts afresh: a reused
+	// map holds the previous message's branch. A null leaves no map.
 	if resSchema.Type() == Null {
+		*(*unsafe.Pointer)(ptr) = nil
 		return
 	}
-
-	if d.mapType.UnsafeIsNil(ptr) {
-		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(1))
-	}
+	d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(1))
 
 	key := schemaTypeName(resSchema)
 	keyPtr := reflect2.PtrOf(key)
@@ -201,16 +211,11 @@ func decoderOfNullableUnion(d *decoderContext, schema Schema, typ reflect2.Type)
 	union := schema.(*UnionSchema)
 	_, typeIdx := union.Indices()
 
-	var (
-		baseTyp reflect2.Type
-		isPtr   bool
-	)
-	switch v := typ.(type) {
-	case *reflect2.UnsafePtrType:
-		baseTyp = v.Elem()
-		isPtr = true
-	case *reflect2.UnsafeSliceType:
-		baseTyp = v
+	// A pointer is decoded through; a slice or a struct held by value is
+	// decoded in place.
+	baseTyp, isPtr := typ, false
+	if v, ok := typ.(*reflect2.UnsafePtrType); ok {
+		baseTyp, isPtr = v.Elem(), true
 	}
 	decoder := decoderOfType(d, union.Types()[typeIdx], baseTyp)
 
@@ -218,14 +223,18 @@ func decoderOfNullableUnion(d *decoderContext, schema Schema, typ reflect2.Type)
 		schema:  union,
 		typ:     baseTyp,
 		isPtr:   isPtr,
+		zero:    baseTyp.UnsafeNew(),
 		decoder: decoder,
 	}
 }
 
 type unionNullableDecoder struct {
-	schema  *UnionSchema
-	typ     reflect2.Type
-	isPtr   bool
+	schema *UnionSchema
+	typ    reflect2.Type
+	isPtr  bool
+	// zero is a zero value of typ, never written: what a null leaves in a
+	// target held by value.
+	zero    unsafe.Pointer
 	decoder ValDecoder
 }
 
@@ -236,38 +245,12 @@ func (d *unionNullableDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	}
 
 	if schema.Type() == Null {
-		*(*unsafe.Pointer)(ptr) = nil
+		d.setNull(ptr)
 		return
 	}
 
 	if r.cfg.typeConverters.HasAny() {
-		defer func() {
-			if !d.isPtr {
-				obj := d.typ.UnsafeIndirect(ptr)
-				obj, err := r.cfg.typeConverters.DecodeTypeConvert(obj, d.schema)
-				if errors.Is(err, errNoTypeConverter) {
-					return
-				}
-				if err != nil {
-					r.Error = err
-				}
-				if obj == nil {
-					*(*unsafe.Pointer)(ptr) = nil
-					return
-				}
-				d.typ.UnsafeSet(ptr, reflect2.PtrOf(obj))
-				return
-			}
-			obj := d.typ.UnsafeIndirect(*(*unsafe.Pointer)(ptr))
-			obj, err := r.cfg.typeConverters.DecodeTypeConvert(obj, d.schema)
-			if errors.Is(err, errNoTypeConverter) {
-				return
-			}
-			if err != nil {
-				r.Error = err
-			}
-			*(*unsafe.Pointer)(ptr) = reflect2.PtrOf(obj)
-		}()
+		defer d.convert(ptr, r)
 	}
 
 	// Handle the non-ptr case separately.
@@ -295,6 +278,60 @@ func (d *unionNullableDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 
 	// Reuse existing instance.
 	d.decoder.Decode(*(*unsafe.Pointer)(ptr), r)
+}
+
+// setNull stores what a null decodes to at ptr: a nil pointer, or the zero
+// value of a slice or struct. Clearing only the first word would leave a
+// slice's length and capacity over a nil array.
+func (d *unionNullableDecoder) setNull(ptr unsafe.Pointer) {
+	if d.isPtr {
+		*(*unsafe.Pointer)(ptr) = nil
+		return
+	}
+	d.typ.UnsafeSet(ptr, d.zero)
+}
+
+// convert runs the union's type converter, if one is registered, over the
+// value just decoded at ptr, and stores what it returns there. A converter may
+// return the target type, or for a pointer the pointed-to type or a pointer to
+// it. Anything else is an error: it cannot be stored as the target.
+func (d *unionNullableDecoder) convert(ptr unsafe.Pointer, r *Reader) {
+	var obj any
+	if d.isPtr {
+		obj = d.typ.UnsafeIndirect(*(*unsafe.Pointer)(ptr))
+	} else {
+		obj = d.typ.UnsafeIndirect(ptr)
+	}
+	obj, err := r.cfg.typeConverters.DecodeTypeConvert(obj, d.schema)
+	if errors.Is(err, errNoTypeConverter) {
+		return
+	}
+	if err != nil {
+		// Reported, and whatever the converter returned is still stored, as
+		// it always was.
+		r.Error = err
+	}
+	if obj == nil {
+		d.setNull(ptr)
+		return
+	}
+
+	v := reflect.ValueOf(obj)
+	want := d.typ.Type1()
+	switch {
+	case v.Type().AssignableTo(want):
+		p := reflect.New(want)
+		p.Elem().Set(v)
+		if d.isPtr {
+			*(*unsafe.Pointer)(ptr) = p.UnsafePointer()
+			return
+		}
+		d.typ.UnsafeSet(ptr, p.UnsafePointer())
+	case d.isPtr && v.Type().AssignableTo(reflect.PointerTo(want)):
+		*(*unsafe.Pointer)(ptr) = v.UnsafePointer()
+	default:
+		r.ReportError("decode union type converter", fmt.Sprintf("got %s, cannot store it as %s", v.Type(), want))
+	}
 }
 
 func encoderOfUnionConverterCodec(_ *encoderContext, schema Schema, typ reflect2.Type) ValEncoder {
@@ -497,8 +534,12 @@ func (d *unionResolvedDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		newPtr = mapType.UnsafeMakeSlice(0, 0)
 
 	case reflect.Pointer:
-		elemType := typ.(*reflect2.UnsafePtrType).Elem()
-		newPtr = elemType.UnsafeNew()
+		// The decoder of a pointer type stores the pointer it decodes into the
+		// slot it is given, so it gets a pointer slot, not the pointed-to
+		// type's storage: that is where the garbage collector does not look for
+		// a pointer, and for a zero-size type it is the word every zero-size
+		// allocation shares.
+		newPtr = unsafe.Pointer(new(unsafe.Pointer))
 
 	default:
 		newPtr = typ.UnsafeNew()
@@ -509,6 +550,9 @@ func (d *unionResolvedDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	*pObj = typ.UnsafeIndirect(newPtr)
 }
 
+// decoderOfUnionConverterCodec decodes a union into a UnionConverter: typ is
+// a pointer to a converter, or a converter struct held by value (its methods
+// on the pointer), which is decoded in place.
 func decoderOfUnionConverterCodec(d *decoderContext, schema *UnionSchema, typ reflect2.Type) ValDecoder {
 	anyDecoder := createDecoderOfUnion(d, schema, reflect2.Type2(reflect.TypeFor[any]()))
 	nullable := slices.ContainsFunc(schema.Types(), func(schema Schema) bool {
@@ -520,6 +564,7 @@ func decoderOfUnionConverterCodec(d *decoderContext, schema *UnionSchema, typ re
 		schema:   schema,
 		nullable: nullable,
 		typ:      typ,
+		zero:     typ.UnsafeNew(),
 	}
 }
 
@@ -528,6 +573,9 @@ type unionConverterFromAnyCodec struct {
 	schema   *UnionSchema
 	nullable bool
 	typ      reflect2.Type
+	// zero is a zero value of typ, never written: a nil pointer, or a zero
+	// struct.
+	zero unsafe.Pointer
 }
 
 func (d *unionConverterFromAnyCodec) Decode(ptr unsafe.Pointer, r *Reader) {
@@ -536,20 +584,28 @@ func (d *unionConverterFromAnyCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	d.decoder.Decode(newPtr, r)
 
 	if *obj == nil {
-		if d.nullable {
+		if !d.nullable {
+			r.Error = errors.New("avro: cannot decode nil value in non-nullable union type")
 			return
 		}
-
-		r.Error = errors.New("avro: cannot decode nil value in non-nullable union type")
+		// A null leaves no converter, or a zero one held by value, not the
+		// previous message's.
+		d.typ.UnsafeSet(ptr, d.zero)
 		return
 	}
 
+	var target any
 	if d.typ.Kind() == reflect.Pointer {
 		ptrType := d.typ.(*reflect2.UnsafePtrType).Elem()
 		elemPtr := ptrType.UnsafeNew()
 		*(*unsafe.Pointer)(ptr) = elemPtr
+		target = d.typ.UnsafeIndirect(ptr)
+	} else {
+		// Held by value: start from the zero value, as a fresh converter
+		// does, and call the methods on its address.
+		d.typ.UnsafeSet(ptr, d.zero)
+		target = reflect2.PtrTo(d.typ).UnsafeIndirect(unsafe.Pointer(&ptr))
 	}
-	target := d.typ.UnsafeIndirect(ptr)
 
 	unionConverter := target.(UnionConverter)
 	if err := unionConverter.FromAny(*obj); err != nil {

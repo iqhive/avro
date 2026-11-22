@@ -203,9 +203,10 @@ func TestGenericDecode(t *testing.T) {
 		},
 		{
 			name: "Union Zero Index",
-			// 0x80 represents 128. So the bytes below will result in 0
-			// as a result of zig-zag encoding.
-			data:    []byte{0x80, 0x80, 0x80, 0x80, 0x30},
+			// A zero padded to the full five bytes of an int. The last byte
+			// may only carry the top 4 bits: 0x30 there is a value past 32
+			// bits, which is an error, not a wrapped zero.
+			data:    []byte{0x80, 0x80, 0x80, 0x80, 0x00},
 			schema:  `["null"]`,
 			wantErr: require.NoError,
 		},

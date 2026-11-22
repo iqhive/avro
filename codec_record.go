@@ -131,6 +131,10 @@ type structDecoder struct {
 }
 
 func (d *structDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
+	if !r.enter() {
+		return
+	}
+
 	for _, field := range d.fields {
 		// Skip case
 		if field.field == nil {
@@ -158,12 +162,14 @@ func (d *structDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		field.decoder.Decode(fieldPtr, r)
 
 		if r.Error != nil && !errors.Is(r.Error, io.EOF) {
-			for _, step := range field.field {
-				r.Error = fmt.Errorf("%s: %w", step.field.Name(), r.Error)
-				return
+			if !isMaxDepth(r.Error) {
+				r.Error = fmt.Errorf("%s: %w", field.field[0].field.Name(), r.Error)
 			}
+			r.leave()
+			return
 		}
 	}
+	r.leave()
 }
 
 func encoderOfStruct(e *encoderContext, rec *RecordSchema, typ reflect2.Type) ValEncoder {
@@ -204,6 +210,12 @@ func encoderOfStruct(e *encoderContext, rec *RecordSchema, typ reflect2.Type) Va
 		}
 
 		defaultType := reflect2.TypeOf(def)
+		if defaultType == nil {
+			// A null default for a union that is not a plain nullable one, such
+			// as ["null", "int", "string"]: encode it as the null type, which
+			// the resolver names.
+			defaultType = reflect2.TypeOf((*null)(nil))
+		}
 		defaultEncoder := encoderOfType(e, field.Type(), defaultType)
 		if defaultType.LikePtr() {
 			defaultEncoder = &onePtrEncoder{defaultEncoder}
@@ -228,6 +240,10 @@ type structEncoder struct {
 }
 
 func (e *structEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
+	if !w.enter() {
+		return
+	}
+
 	for _, field := range e.fields {
 		// Default case
 		if field.field == nil {
@@ -246,6 +262,7 @@ func (e *structEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 			if step.isPointer {
 				if *(*unsafe.Pointer)(fieldPtr) == nil {
 					w.Error = fmt.Errorf("embedded field %q is nil", step.field.Name())
+					w.leave()
 					return
 				}
 
@@ -255,12 +272,14 @@ func (e *structEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		field.encoder.Encode(fieldPtr, w)
 
 		if w.Error != nil && !errors.Is(w.Error, io.EOF) {
-			for _, step := range field.field {
-				w.Error = fmt.Errorf("%s: %w", step.field.Name(), w.Error)
-				return
+			if !isMaxDepth(w.Error) {
+				w.Error = fmt.Errorf("%s: %w", field.field[0].field.Name(), w.Error)
 			}
+			w.leave()
+			return
 		}
 	}
+	w.leave()
 }
 
 func decoderOfRecord(d *decoderContext, schema Schema, typ reflect2.Type) ValDecoder {
@@ -313,6 +332,10 @@ type recordMapDecoder struct {
 }
 
 func (d *recordMapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
+	if !r.enter() {
+		return
+	}
+
 	if d.mapType.UnsafeIsNil(ptr) {
 		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(len(d.fields)))
 	}
@@ -327,9 +350,10 @@ func (d *recordMapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		d.mapType.UnsafeSetIndex(ptr, reflect2.PtrOf(field), elemPtr)
 	}
 
-	if r.Error != nil && !errors.Is(r.Error, io.EOF) {
+	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !isMaxDepth(r.Error) {
 		r.Error = fmt.Errorf("%v: %w", d.mapType, r.Error)
 	}
+	r.leave()
 }
 
 func encoderOfRecord(e *encoderContext, rec *RecordSchema, typ reflect2.Type) ValEncoder {
@@ -348,8 +372,10 @@ func encoderOfRecord(e *encoderContext, rec *RecordSchema, typ reflect2.Type) Va
 			switch {
 			case field.Type().Type() == Union:
 				union := field.Type().(*UnionSchema)
+				// Keyed as the union map encoder looks branches up: by full
+				// name for a named type, not by its type ("record").
 				fields[i].def = map[string]any{
-					string(union.Types()[0].Type()): field.Default(),
+					schemaTypeName(union.Types()[0]): field.Default(),
 				}
 			case field.Default() == nil:
 				continue
@@ -383,6 +409,10 @@ type recordMapEncoder struct {
 }
 
 func (e *recordMapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
+	if !w.enter() {
+		return
+	}
+
 	for _, field := range e.fields {
 		// The first property of mapEncoderField is the name, so a pointer
 		// to field is a pointer to the name.
@@ -391,6 +421,7 @@ func (e *recordMapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 			// Missing required field
 			if !field.hasDef {
 				w.Error = fmt.Errorf("avro: missing required field %s", field.name)
+				w.leave()
 				return
 			}
 
@@ -407,10 +438,14 @@ func (e *recordMapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		field.encoder.Encode(valPtr, w)
 
 		if w.Error != nil && !errors.Is(w.Error, io.EOF) {
-			w.Error = fmt.Errorf("%s: %w", field.name, w.Error)
+			if !isMaxDepth(w.Error) {
+				w.Error = fmt.Errorf("%s: %w", field.name, w.Error)
+			}
+			w.leave()
 			return
 		}
 	}
+	w.leave()
 }
 
 type recordIfaceDecoder struct {

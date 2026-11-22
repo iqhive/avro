@@ -279,12 +279,25 @@ func (c *SchemaCompatibility) Resolve(reader, writer Schema) (Schema, error) {
 		return nil, err
 	}
 
-	schema, _, err := c.resolve(reader, writer)
+	schema, _, err := c.resolve(reader, writer, resolution{})
 	return schema, err
 }
 
+// resolution holds the pairs of reader and writer records resolve has met.
+// A recursive schema meets a record again inside itself, and resolving it
+// afresh there would never end; it refers to the record being resolved
+// instead, as a parsed schema refers to a named type it has defined.
+type resolution map[[2]*RecordSchema]*resolvedRecord
+
+type resolvedRecord struct {
+	schema *RecordSchema
+	// resolved is whether the record differs from the reader's; false until
+	// its fields are resolved.
+	resolved bool
+}
+
 // resolve requires the reader's schema to be already compatible with the writer's.
-func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, resolved bool, err error) {
+func (c *SchemaCompatibility) resolve(reader, writer Schema, res resolution) (schema Schema, resolved bool, err error) {
 	if reader.Type() == Ref {
 		reader = reader.(*RefSchema).Schema()
 	}
@@ -300,7 +313,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 				if err := c.compatible(schema, writer); err != nil {
 					continue
 				}
-				sch, _, err := c.resolve(schema, writer)
+				sch, _, err := c.resolve(schema, writer, res)
 				if err != nil {
 					continue
 				}
@@ -313,7 +326,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 		if writer.Type() == Union {
 			schemas := make([]Schema, 0)
 			for _, schema := range writer.(*UnionSchema).Types() {
-				sch, _, err := c.resolve(reader, schema)
+				sch, _, err := c.resolve(reader, schema, res)
 				if err != nil {
 					return nil, false, err
 				}
@@ -372,7 +385,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 	if writer.Type() == Union {
 		schemas := make([]Schema, 0)
 		for _, s := range writer.(*UnionSchema).Types() {
-			sch, resolv, err := c.resolve(reader, s)
+			sch, resolv, err := c.resolve(reader, s, res)
 			if err != nil {
 				return nil, false, err
 			}
@@ -387,7 +400,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 	}
 
 	if writer.Type() == Array {
-		schema, resolved, err = c.resolve(reader.(*ArraySchema).Items(), writer.(*ArraySchema).Items())
+		schema, resolved, err = c.resolve(reader.(*ArraySchema).Items(), writer.(*ArraySchema).Items(), res)
 		if err != nil {
 			return nil, false, err
 		}
@@ -395,7 +408,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 	}
 
 	if writer.Type() == Map {
-		schema, resolved, err = c.resolve(reader.(*MapSchema).Values(), writer.(*MapSchema).Values())
+		schema, resolved, err = c.resolve(reader.(*MapSchema).Values(), writer.(*MapSchema).Values(), res)
 		if err != nil {
 			return nil, false, err
 		}
@@ -403,15 +416,28 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 	}
 
 	if writer.Type() == Record {
-		return c.resolveRecord(reader, writer)
+		return c.resolveRecord(reader, writer, res)
 	}
 
 	return nil, false, fmt.Errorf("failed to resolve composite schema for %s and %s", reader.Type(), writer.Type())
 }
 
-func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool, error) {
+func (c *SchemaCompatibility) resolveRecord(reader, writer Schema, res resolution) (Schema, bool, error) {
 	w := writer.(*RecordSchema)
 	r := reader.(*RecordSchema)
+
+	key := [2]*RecordSchema{r, w}
+	if prev, ok := res[key]; ok {
+		return NewRefSchema(prev.schema), prev.resolved, nil
+	}
+	// The record exists before its fields, so that they can refer to it.
+	// Nothing reads its fingerprint until resolve returns.
+	rec, err := NewRecordSchema(r.Name(), r.Namespace(), nil, WithAliases(r.Aliases()))
+	if err != nil {
+		return nil, false, err
+	}
+	entry := &resolvedRecord{schema: rec}
+	res[key] = entry
 
 	fields := make([]*Field, 0)
 	seen := make(map[string]struct{})
@@ -433,7 +459,7 @@ func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool
 			continue
 		}
 
-		ft, resolv, err := c.resolve(rf.Type(), wf.Type())
+		ft, resolv, err := c.resolve(rf.Type(), wf.Type(), res)
 		if err != nil {
 			return nil, false, err
 		}
@@ -464,11 +490,13 @@ func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool
 		resolved = true
 	}
 
-	schema, err := NewRecordSchema(r.Name(), r.Namespace(), fields,
-		WithAliases(r.Aliases()),
-		withWriterFingerprintIfResolved(writer.Fingerprint(), resolved),
-	)
-	return schema, resolved, err
+	rec.fields = fields
+	if resolved {
+		fp := writer.Fingerprint()
+		rec.writerFingerprint = &fp
+	}
+	entry.resolved = resolved
+	return rec, resolved, nil
 }
 
 func isNative(typ Type) bool {

@@ -259,7 +259,7 @@ func TestReader_ReadIntSlowPathEOF(t *testing.T) {
 	got := r.ReadInt()
 
 	assert.Zero(t, got)
-	assert.EqualError(t, r.Error, "reading int: EOF")
+	assert.EqualError(t, r.Error, "reading int: unexpected EOF")
 }
 
 func TestReader_ReadLongSlowPathEOF(t *testing.T) {
@@ -269,7 +269,7 @@ func TestReader_ReadLongSlowPathEOF(t *testing.T) {
 	got := r.ReadLong()
 
 	assert.Zero(t, got)
-	assert.EqualError(t, r.Error, "reading long: EOF")
+	assert.EqualError(t, r.Error, "reading long: unexpected EOF")
 }
 
 func TestReader_ReadBlockHeaderBounds(t *testing.T) {

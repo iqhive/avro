@@ -43,7 +43,8 @@ func NewDecoder(client *Client, opts ...DecoderFunc) *Decoder {
 // See:
 // https://docs.confluent.io/3.2.0/schema-registry/docs/serializer-formatter.html#wire-format.
 func (d *Decoder) Decode(ctx context.Context, data []byte, v any) error {
-	if len(data) < 6 {
+	// The 5-byte header may be all there is: some values encode to no bytes.
+	if len(data) < 5 {
 		return errors.New("data too short")
 	}
 

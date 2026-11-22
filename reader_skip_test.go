@@ -40,16 +40,20 @@ func TestReader_SkipBool(t *testing.T) {
 
 func TestReader_SkipInt(t *testing.T) {
 	tests := []struct {
-		name string
-		data []byte
+		name    string
+		data    []byte
+		wantErr bool
 	}{
 		{
 			name: "Skipped",
 			data: []byte{0x38, 0x36},
 		},
 		{
-			name: "Overflow",
-			data: []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0x36},
+			// One continuation byte more than the type allows: reading
+			// refuses it, and so does skipping.
+			name:    "Overflow",
+			wantErr: true,
+			data:    []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0x36},
 		},
 	}
 
@@ -59,6 +63,10 @@ func TestReader_SkipInt(t *testing.T) {
 
 			r.SkipInt()
 
+			if test.wantErr {
+				assert.Error(t, r.Error)
+				return
+			}
 			require.NoError(t, r.Error)
 			assert.Equal(t, int32(27), r.ReadInt())
 		})
@@ -67,16 +75,20 @@ func TestReader_SkipInt(t *testing.T) {
 
 func TestReader_SkipLong(t *testing.T) {
 	tests := []struct {
-		name string
-		data []byte
+		name    string
+		data    []byte
+		wantErr bool
 	}{
 		{
 			name: "Skipped",
 			data: []byte{0x38, 0x36},
 		},
 		{
-			name: "Overflow",
-			data: []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0x36},
+			// One continuation byte more than the type allows: reading
+			// refuses it, and so does skipping.
+			name:    "Overflow",
+			wantErr: true,
+			data:    []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0x36},
 		},
 	}
 
@@ -86,6 +98,10 @@ func TestReader_SkipLong(t *testing.T) {
 
 			r.SkipLong()
 
+			if test.wantErr {
+				assert.Error(t, r.Error)
+				return
+			}
 			require.NoError(t, r.Error)
 			assert.Equal(t, int32(27), r.ReadInt())
 		})

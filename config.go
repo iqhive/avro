@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"errors"
 	"io"
 	"sync"
 
@@ -12,6 +11,8 @@ const (
 	defaultMaxByteSliceSize = 1_048_576 // 1 MiB
 
 	defaultSlabSize = 1024
+
+	defaultMaxDepth = 10_000
 
 	defaultWriteBufSize = 512
 	defaultReadBufSize  = 512
@@ -66,6 +67,14 @@ type Config struct {
 	// allocation size by default.
 	// If this size is exceeded, the decoder returns an error.
 	MaxMapAllocSize int
+
+	// MaxDepth is how deeply records may nest in a value being decoded or
+	// encoded, which only a recursive schema lets grow without bound. This
+	// defaults to 10000. Past it the decoder or encoder returns an error: each
+	// level is a step of Go recursion, so with no limit a small message for a
+	// recursive schema, or a Go value that refers to itself, would overflow the
+	// goroutine stack, which ends the program.
+	MaxDepth int
 
 	// SlabSize is the size of the byte slab used by the Reader for small string/bytes allocations.
 	// This defaults to 1024 bytes. Reads up to this size use the slab allocator, avoiding per-read
@@ -193,13 +202,10 @@ func (c *frozenConfig) Unmarshal(schema Schema, data []byte, v any) error {
 	defer c.returnReader(reader)
 
 	reader.ReadVal(schema, v)
-	err := reader.Error
 
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
-
-	return err
+	// Running out of data before the value is complete is an error, not the
+	// end of a stream.
+	return cutShort(reader.Error)
 }
 
 func (c *frozenConfig) borrowReader(data []byte) *Reader {
@@ -331,6 +337,13 @@ func (c *frozenConfig) getMaxMapAllocSize() int {
 		return maxAllocSize
 	}
 	return size
+}
+
+func (c *frozenConfig) getMaxDepth() int {
+	if c.config.MaxDepth <= 0 {
+		return defaultMaxDepth
+	}
+	return c.config.MaxDepth
 }
 
 func (c *frozenConfig) getSlabSize() int {

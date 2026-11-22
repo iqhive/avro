@@ -11,6 +11,10 @@ func createSkipDecoder(schema Schema) ValDecoder {
 
 func createSkipDecoderWithCache(schema Schema, cache map[[32]byte]ValDecoder) ValDecoder {
 	switch schema.Type() {
+	case Null:
+		// A null takes no bytes.
+		return &nullCodec{}
+
 	case Boolean:
 		return &boolSkipDecoder{}
 
@@ -130,9 +134,16 @@ type recordSkipDecoder struct {
 }
 
 func (d *recordSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
+	if !r.enter() {
+		return
+	}
 	for _, decoder := range d.decoders {
 		decoder.Decode(nil, r)
+		if r.Error != nil {
+			break
+		}
 	}
+	r.leave()
 }
 
 type enumSkipDecoder struct {

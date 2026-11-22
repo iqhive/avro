@@ -87,11 +87,19 @@ func (r *Reader) ReadNext(schema Schema) any {
 		}
 		return r.ReadBytes()
 	case Record:
+		if !r.enter() {
+			return nil
+		}
 		fields := schema.(*RecordSchema).Fields()
 		obj := make(map[string]any, len(fields))
 		for _, field := range fields {
 			obj[field.Name()] = r.ReadNext(field.Type())
+			if r.Error != nil {
+				obj = nil
+				break
+			}
 		}
+		r.leave()
 		return obj
 	case Ref:
 		return r.ReadNext(schema.(*RefSchema).Schema())
@@ -121,14 +129,15 @@ func (r *Reader) ReadNext(schema Schema) any {
 		return obj
 	case Union:
 		types := schema.(*UnionSchema).Types()
-		idx64 := r.ReadLong()
-		// Compare in int64 to reject values that would truncate on 32-bit
-		// (e.g. 1<<32 narrows to 0 and silently selects types[0]).
-		if idx64 < 0 || idx64 > int64(len(types)-1) {
+		// The branch is an int, read as the decoders read it.
+		idx := int(r.ReadInt())
+		if r.Error != nil {
+			return nil
+		}
+		if idx < 0 || idx > len(types)-1 {
 			r.ReportError("Read", "unknown union type")
 			return nil
 		}
-		idx := int(idx64)
 		schema = types[idx]
 		if schema.Type() == Null {
 			return nil

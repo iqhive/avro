@@ -53,6 +53,9 @@ func (d *defaultDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	defer r.cfg.returnReader(rr)
 
 	d.decoder.Decode(ptr, rr)
+	if rr.Error != nil && r.Error == nil {
+		r.Error = fmt.Errorf("decode default: %w", rr.Error)
+	}
 }
 
 var _ ValDecoder = &defaultDecoder{}

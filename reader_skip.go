@@ -21,6 +21,7 @@ func (r *Reader) SkipNBytes(n int) {
 	for read < n {
 		if r.head == r.tail {
 			if !r.loadMore() {
+				r.Error = cutShort(r.Error)
 				return
 			}
 		}
@@ -43,26 +44,44 @@ func (r *Reader) SkipBool() {
 
 // SkipInt skips an Int in the reader.
 func (r *Reader) SkipInt() {
-	var n int
-	for r.Error == nil && n < maxIntBufSize {
-		b := r.readByte()
-		if b&0x80 == 0 {
-			break
-		}
-		n++
+	if r.Error != nil {
+		return
 	}
+	for i := range maxIntBufSize {
+		b := r.readByte()
+		if r.Error != nil {
+			return
+		}
+		if b&0x80 == 0 {
+			if i == maxIntBufSize-1 && b > lastIntByte {
+				break
+			}
+			return
+		}
+	}
+	// Reading would refuse it too: an int takes at most maxIntBufSize bytes.
+	r.ReportError("SkipInt", "int overflow")
 }
 
 // SkipLong skips a Long in the reader.
 func (r *Reader) SkipLong() {
-	var n int
-	for r.Error == nil && n < maxLongBufSize {
-		b := r.readByte()
-		if b&0x80 == 0 {
-			break
-		}
-		n++
+	if r.Error != nil {
+		return
 	}
+	for i := range maxLongBufSize {
+		b := r.readByte()
+		if r.Error != nil {
+			return
+		}
+		if b&0x80 == 0 {
+			if i == maxLongBufSize-1 && b > lastLongByte {
+				break
+			}
+			return
+		}
+	}
+	// Reading would refuse it too: a long takes at most maxLongBufSize bytes.
+	r.ReportError("SkipLong", "long overflow")
 }
 
 // SkipFloat skips a Float in the reader.

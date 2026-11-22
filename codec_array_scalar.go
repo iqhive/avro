@@ -36,17 +36,17 @@ func newScalarArrayDecoder(schema *ArraySchema, sliceType *reflect2.UnsafeSliceT
 		case reflect.Int:
 			return &scalarArrayDecoder[int]{sliceType, fillInts[int]}, true
 		case reflect.Int8:
-			return &scalarArrayDecoder[int8]{sliceType, fillInts[int8]}, true
+			return &scalarArrayDecoder[int8]{sliceType, fillIntsChecked[int8]}, true
 		case reflect.Int16:
-			return &scalarArrayDecoder[int16]{sliceType, fillInts[int16]}, true
+			return &scalarArrayDecoder[int16]{sliceType, fillIntsChecked[int16]}, true
 		case reflect.Int32:
 			return &scalarArrayDecoder[int32]{sliceType, fillInts[int32]}, true
 		case reflect.Uint:
-			return &scalarArrayDecoder[uint]{sliceType, fillInts[uint]}, true
+			return &scalarArrayDecoder[uint]{sliceType, fillIntsChecked[uint]}, true
 		case reflect.Uint8:
-			return &scalarArrayDecoder[uint8]{sliceType, fillInts[uint8]}, true
+			return &scalarArrayDecoder[uint8]{sliceType, fillIntsChecked[uint8]}, true
 		case reflect.Uint16:
-			return &scalarArrayDecoder[uint16]{sliceType, fillInts[uint16]}, true
+			return &scalarArrayDecoder[uint16]{sliceType, fillIntsChecked[uint16]}, true
 		}
 	case Long:
 		switch elemKind {
@@ -55,11 +55,11 @@ func newScalarArrayDecoder(schema *ArraySchema, sliceType *reflect2.UnsafeSliceT
 				return &scalarArrayDecoder[int]{sliceType, fillLongs[int]}, true
 			}
 		case reflect.Int32:
-			return &scalarArrayDecoder[int32]{sliceType, fillLongs[int32]}, true
+			return &scalarArrayDecoder[int32]{sliceType, fillLongsChecked[int32]}, true
 		case reflect.Int64:
 			return &scalarArrayDecoder[int64]{sliceType, fillLongs[int64]}, true
 		case reflect.Uint32:
-			return &scalarArrayDecoder[uint32]{sliceType, fillLongs[uint32]}, true
+			return &scalarArrayDecoder[uint32]{sliceType, fillLongsChecked[uint32]}, true
 		}
 	case Float:
 		if elemKind == reflect.Float32 {
@@ -93,6 +93,9 @@ func (d *scalarArrayDecoder[T]) Decode(ptr unsafe.Pointer, r *Reader) {
 	if sliceType.UnsafeIsNil(ptr) {
 		sliceType.UnsafeSet(ptr, sliceType.UnsafeMakeSlice(0, 0))
 	}
+	// A reused slice holds the previous value: an empty array must leave it
+	// empty.
+	sliceType.UnsafeGrow(ptr, 0)
 
 	var size int
 	for {
@@ -106,19 +109,19 @@ func (d *scalarArrayDecoder[T]) Decode(ptr unsafe.Pointer, r *Reader) {
 			return
 		}
 
-		newSize := size + l
-		sliceType.UnsafeGrow(ptr, newSize)
+		for end := size + l; size < end; {
+			n := arrayGrowth(size, end)
+			sliceType.UnsafeGrow(ptr, n)
 
-		base := sliceType.UnsafeGetIndex(ptr, size)
-		data := unsafe.Slice((*T)(base), l)
+			base := sliceType.UnsafeGetIndex(ptr, size)
+			d.fill(unsafe.Slice((*T)(base), n-size), r)
+			if r.Error != nil {
+				r.Error = fmt.Errorf("reading %s: %w", sliceType.String(), r.Error)
+				return
+			}
 
-		d.fill(data, r)
-		if r.Error != nil {
-			r.Error = fmt.Errorf("reading %s: %w", sliceType.String(), r.Error)
-			return
+			size = n
 		}
-
-		size = newSize
 	}
 
 	if r.Error != nil && !errors.Is(r.Error, io.EOF) {
@@ -141,7 +144,7 @@ func continueVarint32(tail []byte, b0 byte) (uint32, int, bool) {
 	for k, b := range tail {
 		v |= uint32(b&0x7f) << s
 		if b&0x80 == 0 {
-			return v, k + 2, true
+			return v, k + 2, k < maxIntBufSize-2 || b <= lastIntByte
 		}
 		s += 7
 	}
@@ -155,7 +158,7 @@ func continueVarint64(tail []byte, b0 byte) (uint64, int, bool) {
 	for k, b := range tail {
 		v |= uint64(b&0x7f) << s
 		if b&0x80 == 0 {
-			return v, k + 2, true
+			return v, k + 2, k < maxLongBufSize-2 || b <= lastLongByte
 		}
 		s += 7
 	}
@@ -206,6 +209,63 @@ func fillInts[T smallInt](data []T, r *Reader) {
 	}
 }
 
+// fillIntsChecked is fillInts for a T that cannot hold every int, such as
+// int8 or uint16: a value that does not fit T is an error, not a wrapped
+// value. The check is kept out of fillInts, the loop for the types that hold
+// every int, which it would slow.
+func fillIntsChecked[T smallInt](data []T, r *Reader) {
+	if r.Error != nil {
+		return
+	}
+	head := r.head
+	n := len(data)
+	i := 0
+	decode := func() uint32 {
+		b := r.buf[head]
+		if b < 0x80 {
+			head++
+			return uint32(b)
+		}
+		v, adv, ok := continueVarint32(r.buf[head+1:head+maxIntBufSize], b)
+		if !ok {
+			r.Error = errReadIntOverflow
+			return 0
+		}
+		head += adv
+		return v
+	}
+	for r.Error == nil && i+2 <= n && r.tail-head >= 2*maxIntBufSize {
+		v0, v1 := decode(), decode()
+		x0, x1 := int32((v0>>1)^-(v0&1)), int32((v1>>1)^-(v1&1))
+		if !fits[T](int64(x0)) || !fits[T](int64(x1)) {
+			reportDoesNotFit[T](r, x0, x1)
+			return
+		}
+		data[i] = T(x0)
+		data[i+1] = T(x1)
+		i += 2
+	}
+	for r.Error == nil && i < n && r.tail-head >= maxIntBufSize {
+		v := decode()
+		x := int32((v >> 1) ^ -(v & 1))
+		if !fits[T](int64(x)) {
+			reportDoesNotFit[T](r, x)
+			return
+		}
+		data[i] = T(x)
+		i++
+	}
+	r.head = head
+	for ; r.Error == nil && i < n; i++ {
+		x := r.ReadInt()
+		if !fits[T](int64(x)) {
+			reportDoesNotFit[T](r, x)
+			return
+		}
+		data[i] = T(x)
+	}
+}
+
 // fillLongs is the maxLongBufSize counterpart of fillInts.
 func fillLongs[T largeInt](data []T, r *Reader) {
 	if r.Error != nil {
@@ -242,6 +302,61 @@ func fillLongs[T largeInt](data []T, r *Reader) {
 	r.head = head
 	for ; r.Error == nil && i < n; i++ {
 		data[i] = T(r.ReadLong())
+	}
+}
+
+// fillLongsChecked is fillLongs for a T that cannot hold every long, such as
+// int32 or uint32.
+func fillLongsChecked[T largeInt](data []T, r *Reader) {
+	if r.Error != nil {
+		return
+	}
+	head := r.head
+	n := len(data)
+	i := 0
+	decode := func() uint64 {
+		b := r.buf[head]
+		if b < 0x80 {
+			head++
+			return uint64(b)
+		}
+		v, adv, ok := continueVarint64(r.buf[head+1:head+maxLongBufSize], b)
+		if !ok {
+			r.Error = errReadLongOverflow
+			return 0
+		}
+		head += adv
+		return v
+	}
+	for r.Error == nil && i+2 <= n && r.tail-head >= 2*maxLongBufSize {
+		v0, v1 := decode(), decode()
+		x0, x1 := int64((v0>>1)^-(v0&1)), int64((v1>>1)^-(v1&1))
+		if !fits[T](x0) || !fits[T](x1) {
+			reportDoesNotFit[T](r, x0, x1)
+			return
+		}
+		data[i] = T(x0)
+		data[i+1] = T(x1)
+		i += 2
+	}
+	for r.Error == nil && i < n && r.tail-head >= maxLongBufSize {
+		v := decode()
+		x := int64((v >> 1) ^ -(v & 1))
+		if !fits[T](x) {
+			reportDoesNotFit[T](r, x)
+			return
+		}
+		data[i] = T(x)
+		i++
+	}
+	r.head = head
+	for ; r.Error == nil && i < n; i++ {
+		x := r.ReadLong()
+		if !fits[T](x) {
+			reportDoesNotFit[T](r, x)
+			return
+		}
+		data[i] = T(x)
 	}
 }
 
@@ -293,7 +408,7 @@ func newScalarArrayEncoder(e *encoderContext, schema *ArraySchema, sliceType *re
 	case Int:
 		switch elemKind {
 		case reflect.Int:
-			return &scalarArrayEncoder[int]{blockLength, sliceType, drainInts[int]}, true
+			return &scalarArrayEncoder[int]{blockLength, sliceType, drainIntsChecked[int]}, true
 		case reflect.Int8:
 			return &scalarArrayEncoder[int8]{blockLength, sliceType, drainInts[int8]}, true
 		case reflect.Int16:
@@ -301,7 +416,7 @@ func newScalarArrayEncoder(e *encoderContext, schema *ArraySchema, sliceType *re
 		case reflect.Int32:
 			return &scalarArrayEncoder[int32]{blockLength, sliceType, drainInts[int32]}, true
 		case reflect.Uint:
-			return &scalarArrayEncoder[uint]{blockLength, sliceType, drainInts[uint]}, true
+			return &scalarArrayEncoder[uint]{blockLength, sliceType, drainIntsChecked[uint]}, true
 		case reflect.Uint8:
 			return &scalarArrayEncoder[uint8]{blockLength, sliceType, drainInts[uint8]}, true
 		case reflect.Uint16:
@@ -382,6 +497,24 @@ func (e *scalarArrayEncoder[T]) Encode(ptr unsafe.Pointer, w *Writer) {
 func drainInts[T smallInt](data []T, w *Writer) {
 	buf := w.buf
 	for _, v := range data {
+		i := int32(v)
+		z := uint64((uint32(i) << 1) ^ uint32(i>>31))
+		buf = appendVarint(buf, z)
+	}
+
+	w.buf = buf
+}
+
+// drainIntsChecked is drainInts for a T whose values may not fit an Avro
+// int, int or uint: one that does not is an error, not a truncated value.
+func drainIntsChecked[T smallInt](data []T, w *Writer) {
+	buf := w.buf
+	for _, v := range data {
+		if !fitsInt(v) {
+			w.buf = buf
+			w.Error = fmt.Errorf("avro: %d does not fit an Avro int", v)
+			return
+		}
 		i := int32(v)
 		z := uint64((uint32(i) << 1) ^ uint32(i>>31))
 		buf = appendVarint(buf, z)

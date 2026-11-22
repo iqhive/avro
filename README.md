@@ -21,6 +21,32 @@ This is iqhive's fork of [hamba/avro](https://github.com/hamba/avro), which was 
 - The module path is `github.com/iqhive/avro/v2`. Moving from hamba/avro or iskorotkov/avro means changing the import paths.
 - iskorotkov/avro's main branch is merged into this repository's `iskorotkov` branch every day. Once a week, what that branch brings in is tested and reviewed, and merged into `main` when the review finds no new bugs or security issues.
 
+Fixed in iqhive/avro (each has a regression test in `fork_fixes_test.go`):
+
+- **Memory safety:** a union decoded into a struct held by value, or into a value-held `UnionConverter`, wrote through
+  the struct's first field as a pointer; a `null` into a reused slice left its length over a nil array; a union decoded
+  into `any` through a registered pointer type stored a pointer where the garbage collector does not look for one; a
+  type converter's result was stored unchecked; and the encoder read a struct under a bytes decimal schema as a
+  `big.Rat`, past its end.
+- **Crashes:** deeply nested data for a recursive schema, a Go value that refers to itself, `type P *P`, and resolving a
+  recursive schema overflowed the goroutine stack (a fatal error). Records may now nest `Config.MaxDepth` deep
+  (default 10000). Encoding a nil `*big.Rat`, a missing field whose union default is `null`, and `Unmarshal` into
+  `nil` panicked.
+- **Denial of service:** array and map block counts no longer drive allocation before the data is read, and a map
+  with `TextUnmarshaler` keys stops at the first error.
+- **Silent data loss:** truncated input was decoded without error; integers that do not fit the Go or Avro type were
+  wrapped; a `big.Rat` value decoded as 0; reused slices, maps, unions and converters kept the previous message's
+  values; appending to a decoded `[]byte` overwrote the values decoded after it; pre-1970 dates with a time of day
+  were a day late; negative decimals rounded away from zero; fixed decimals accepted a precision their size cannot
+  hold; defaults that failed to decode were dropped; and encoders were cached without regard to field defaults.
+- **Schema registry client:** a subject was put into the request path unescaped, so one holding `/`, `?`, `#` or `..`
+  reached another endpoint (`DeleteSubject("../config")` sent a DELETE for `/config`, the global configuration), and a message whose
+  payload encodes to no bytes was refused as too short.
+- **Other:** an int or long varint with bits past the type's width read as a different, wrapped value (and `ReadNext`
+  disagreed with the decoders about such a union branch); skipping a `null` field failed; skipping accepted over-long
+  varints; a map record's union default was looked up by type instead of name; and the fixed-to-`uint64` codec raced
+  under concurrent use.
+
 ## Why this fork?
 
 `hamba/avro` was archived in January 2026 and will receive no further updates or bug fixes. There is no other actively maintained Go Avro library that matches its performance. This fork exists to keep the library maintained, fix bugs, and improve it further.
@@ -132,14 +158,15 @@ More examples in the [godoc](https://pkg.go.dev/github.com/iqhive/avro/v2).
 | `string.uuid`                 | `string`                                                   | `string`                 |
 
 \* Please note that the size of the Go type `int` is platform dependent. Decoding an Avro `long` into a Go `int` is
-only allowed on 64-bit platforms and will result in an error on 32-bit platforms. Similarly, be careful when encoding a
-Go `int` using Avro `int` on a 64-bit platform, as that can result in an integer overflow causing misinterpretation of
-the data.
+only allowed on 64-bit platforms and will result in an error on 32-bit platforms. Encoding a Go `int` as an Avro `int`
+is an error when the value does not fit 32 bits.
 
-\** Please note that when the Go type is an unsigned integer care must be taken to ensure that information is not lost
-when converting between the Avro type and Go type. For example, storing a *negative* number in Avro of `int = -100`
-would be interpreted as `uint16 = 65,436` in Go. Another example would be storing numbers in Avro `int = 256` that
-are larger than the Go type `uint8 = 0`.
+\** A value that does not fit the Go type is an error, not a wrapped value: a *negative* Avro `int = -100` decoded
+into a `uint16`, or `int = 256` decoded into a `uint8`, fails. (iqhive/avro; hamba/avro wrapped such values silently.)
+
+Decoding into a value that already holds data overwrites what the data names. A map keeps the entries the new data
+does not name, as `encoding/json` does; a slice, including one decoded from an empty array, holds exactly the new
+elements; and struct fields the schema does not name are left as they were.
 
 #### Unions
 
@@ -151,7 +178,8 @@ type name, or schema full name in the case of a named schema (enum, fixed or rec
 * ***T:** This is allowed in a "nullable" union. A nullable union is defined as a two schema union,
 with one of the types being `null` (ie. `["null", "string"]` or `["string", "null"]`), in this case
 a `*T` is allowed, with `T` matching the conversion table above. In the case of a slice, the slice can be used
-directly.
+directly. A struct held by value (`T` rather than `*T`, for a record or a `time.Time`) is decoded in place, and a
+`null` leaves its zero value.
 * ***struct{}:** implementing the `UnionConverter` interface:
 
 ```go

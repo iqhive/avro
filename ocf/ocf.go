@@ -691,10 +691,11 @@ func readHeader(reader *avro.Reader, schemaCache *avro.SchemaCache, codecOpts co
 
 func skipToEnd(reader *avro.Reader, sync [16]byte) error {
 	for {
-		count := reader.ReadLong()
-		if errors.Is(reader.Error, io.EOF) {
+		// The file may end between blocks, and only there.
+		if _ = reader.Peek(); errors.Is(reader.Error, io.EOF) {
 			return nil
 		}
+		count := reader.ReadLong()
 		if count < 0 {
 			return errors.New("ocf decoder: negative record count")
 		}

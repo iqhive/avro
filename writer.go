@@ -25,6 +25,7 @@ type Writer struct {
 	out     io.Writer
 	buf     []byte
 	scratch []byte
+	depth   int
 	Error   error
 }
 
@@ -45,6 +46,26 @@ func NewWriter(out io.Writer, bufSize int, opts ...WriterFunc) *Writer {
 func (w *Writer) Reset(out io.Writer) {
 	w.out = out
 	w.buf = w.buf[:0]
+	w.depth = 0
+}
+
+// enter counts one more level of record nesting and reports whether it is
+// within Config.MaxDepth. Past it, it records errMaxDepth and the level is not
+// counted, so a caller that gets false must not call leave.
+func (w *Writer) enter() bool {
+	if w.depth >= w.cfg.getMaxDepth() {
+		if w.Error == nil {
+			w.Error = errMaxDepth
+		}
+		return false
+	}
+	w.depth++
+	return true
+}
+
+// leave ends a level that enter counted.
+func (w *Writer) leave() {
+	w.depth--
 }
 
 // Buffered returns the number of buffered bytes.

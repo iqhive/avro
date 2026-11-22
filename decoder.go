@@ -35,10 +35,9 @@ func (d *Decoder) Decode(v any) error {
 
 	d.r.ReadVal(d.s, v)
 
-	//nolint:errorlint // Only direct EOF errors should be discarded.
-	if d.r.Error == io.EOF {
-		return nil
-	}
+	// The input ending inside the value is an error: io.EOF, above, means it
+	// ended between values.
+	d.r.Error = cutShort(d.r.Error)
 	return d.r.Error
 }
 

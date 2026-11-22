@@ -2,18 +2,38 @@ package avro
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
 	"unsafe"
 
 	"github.com/modern-go/reflect2"
 )
 
 func decoderOfPtr(d *decoderContext, schema Schema, typ reflect2.Type) ValDecoder {
+	if pointsToItself(typ) {
+		return &errorDecoder{err: fmt.Errorf("avro: %s is a pointer to itself, which no value can end", typ)}
+	}
 	ptrType := typ.(*reflect2.UnsafePtrType)
 	elemType := ptrType.Elem()
 
 	decoder := decoderOfType(d, schema, elemType)
 
 	return &dereferenceDecoder{typ: elemType, decoder: decoder}
+}
+
+// pointsToItself reports whether following typ's pointer elements leads back
+// to a type already passed, as with `type P *P`. Building a codec for such a
+// type would recurse for ever.
+func pointsToItself(typ reflect2.Type) bool {
+	seen := map[uintptr]bool{}
+	for typ.Kind() == reflect.Pointer {
+		if seen[typ.RType()] {
+			return true
+		}
+		seen[typ.RType()] = true
+		typ = typ.(*reflect2.UnsafePtrType).Elem()
+	}
+	return false
 }
 
 type dereferenceDecoder struct {
@@ -35,6 +55,9 @@ func (d *dereferenceDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 }
 
 func encoderOfPtr(e *encoderContext, schema Schema, typ reflect2.Type) ValEncoder {
+	if pointsToItself(typ) {
+		return &errorEncoder{err: fmt.Errorf("avro: %s is a pointer to itself, which no value can end", typ)}
+	}
 	ptrType := typ.(*reflect2.UnsafePtrType)
 	elemType := ptrType.Elem()
 
