@@ -83,7 +83,7 @@ func (r *Reader) ReadNext(schema Schema) any {
 	case Bytes:
 		if ls != nil && ls.Type() == Decimal {
 			dec := ls.(*DecimalLogicalSchema)
-			return ratFromBytes(r.ReadBytes(), dec.Scale())
+			return ratFromBytes(r, r.ReadBytes(), dec.Scale())
 		}
 		return r.ReadBytes()
 	case Record:
@@ -153,7 +153,7 @@ func (r *Reader) ReadNext(schema Schema) any {
 		r.Read(obj)
 		if ls != nil && ls.Type() == Decimal {
 			dec := ls.(*DecimalLogicalSchema)
-			return ratFromBytes(obj, dec.Scale())
+			return ratFromBytes(r, obj, dec.Scale())
 		}
 		return byteSliceToArray(obj, size)
 	default:

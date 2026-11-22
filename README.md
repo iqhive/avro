@@ -33,7 +33,13 @@ Fixed in iqhive/avro (each has a regression test in `fork_fixes_test.go`):
   (default 10000). Encoding a nil `*big.Rat`, a missing field whose union default is `null`, and `Unmarshal` into
   `nil` panicked.
 - **Denial of service:** array and map block counts no longer drive allocation before the data is read, and a map
-  with `TextUnmarshaler` keys stops at the first error.
+  with `TextUnmarshaler` keys stops at the first error. A `fixed` schema could declare any size and the library
+  allocated it — decoding into `any` made the array before a byte of data was read, and parsing a field default
+  made it from the schema alone — so a sixty-byte schema from an untrusted OCF header or schema registry could
+  demand a terabyte; sizes are now capped at 16 MiB. A `bytes` or `fixed` decimal could declare any precision,
+  and decoding one value computed 10^scale from scratch, so a schema with scale 999999999 spent unbounded time
+  and memory on every value; precision is now capped at 100000, and a scale past the cap is refused even in a
+  schema built in Go.
 - **Silent data loss:** truncated input was decoded without error; integers that do not fit the Go or Avro type were
   wrapped; a `big.Rat` value decoded as 0; reused slices, maps, unions and converters kept the previous message's
   values; appending to a decoded `[]byte` overwrote the values decoded after it; pre-1970 dates with a time of day

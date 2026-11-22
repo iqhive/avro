@@ -556,6 +556,13 @@ func newDecimalLogicalType(size, prec, scale int) LogicalSchema {
 		}
 	}
 
+	// Decoding a value computes 10^scale, so no matter where the precision
+	// comes from it must stay within reach. An invalid decimal falls back to
+	// the underlying type, as the other checks here do.
+	if prec > maxDecimalPrecision {
+		return nil
+	}
+
 	if scale < 0 {
 		return nil
 	}

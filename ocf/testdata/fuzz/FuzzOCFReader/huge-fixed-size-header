@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("Obj\x01\x02\x16avro.schema\xd8\x01{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"f\",\"type\":{\"type\":\"fixed\",\"name\":\"F\",\"size\":1099511627776}}]}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")

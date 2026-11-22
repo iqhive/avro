@@ -137,7 +137,7 @@ type fixedDecimalCodec struct {
 func (c *fixedDecimalCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	b := make([]byte, c.size)
 	r.Read(b)
-	*(**big.Rat)(ptr) = ratFromBytes(b, c.scale)
+	*(**big.Rat)(ptr) = ratFromBytes(r, b, c.scale)
 }
 
 func (c *fixedDecimalCodec) Encode(ptr unsafe.Pointer, w *Writer) {
@@ -146,7 +146,10 @@ func (c *fixedDecimalCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 		w.Error = errors.New("avro: cannot encode a nil *big.Rat as Avro fixed.decimal")
 		return
 	}
-	i := unscaled(r, c.scale)
+	i := unscaled(w, r, c.scale)
+	if i == nil {
+		return
+	}
 
 	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
 		w.Error = fmt.Errorf(

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -885,7 +886,7 @@ func (f *Field) MarshalJSON() ([]byte, error) {
 	buf.WriteString(`,"type":`)
 	buf.Write(typeJSON)
 	if f.hasDef {
-		defaultValueJSON, err := json.Marshal(f.Default())
+		defaultValueJSON, err := marshalDefaultJSON(f.Default())
 		if err != nil {
 			return nil, err
 		}
@@ -900,6 +901,90 @@ func (f *Field) MarshalJSON() ([]byte, error) {
 	}
 	buf.WriteString("}")
 	return buf.Bytes(), nil
+}
+
+// marshalDefaultJSON marshals a field default to its JSON form.
+//
+// Parse stores bytes and fixed defaults as []byte and [size]byte, which
+// json.Marshal encodes as base64 strings and arrays, but the specification
+// defines them as JSON strings whose Unicode code points 0-255 map to byte
+// values 0-255. Marshal them back to that form, and the ones nested in array
+// and map defaults, so a marshalled schema parses back to the same one.
+func marshalDefaultJSON(def any) ([]byte, error) {
+	switch v := def.(type) {
+	case []byte:
+		return marshalDefaultBytesJSON(v), nil
+	case []any:
+		buf := new(bytes.Buffer)
+		buf.WriteByte('[')
+		for i, e := range v {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			eJSON, err := marshalDefaultJSON(e)
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(eJSON)
+		}
+		buf.WriteByte(']')
+		return buf.Bytes(), nil
+	case map[string]any:
+		buf := new(bytes.Buffer)
+		buf.WriteByte('{')
+		for i, k := range slices.Sorted(maps.Keys(v)) {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			kJSON, err := json.Marshal(k)
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(kJSON)
+			buf.WriteByte(':')
+			eJSON, err := marshalDefaultJSON(v[k])
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(eJSON)
+		}
+		buf.WriteByte('}')
+		return buf.Bytes(), nil
+	default:
+		if rv := reflect.ValueOf(def); rv.Kind() == reflect.Array && rv.Type().Elem().Kind() == reflect.Uint8 {
+			b := make([]byte, rv.Len())
+			for i := range b {
+				b[i] = byte(rv.Index(i).Uint())
+			}
+			return marshalDefaultBytesJSON(b), nil
+		}
+	}
+
+	return json.Marshal(def)
+}
+
+// marshalDefaultBytesJSON encodes b as a JSON string with one Unicode code
+// point 0-255 per byte, the inverse of isValidDefaultBytes. json.Marshal
+// instead encodes the string's raw bytes, which reparse differently for any
+// byte over 0x7f.
+func marshalDefaultBytesJSON(b []byte) []byte {
+	buf := new(bytes.Buffer)
+	buf.WriteByte('"')
+	for _, c := range b {
+		switch {
+		case c == '"':
+			buf.WriteString(`\"`)
+		case c == '\\':
+			buf.WriteString(`\\`)
+		case c < 0x20 || c >= 0x80:
+			fmt.Fprintf(buf, `\u%04x`, c)
+		default:
+			buf.WriteByte(c)
+		}
+	}
+	buf.WriteByte('"')
+
+	return buf.Bytes()
 }
 
 // EnumSchema is an Avro enum type schema.
@@ -1348,6 +1433,15 @@ type FixedSchema struct {
 	logical LogicalSchema
 }
 
+// maxFixedSchemaSize is the largest size a fixed schema may declare.
+//
+// A schema from an untrusted OCF header or schema registry could claim any
+// size, and decoding a fixed into `any`, or parsing a fixed field with a
+// default, allocated that many bytes: a sixty-byte schema could demand a
+// terabyte. A fixed is Avro's type for small binary blobs such as hashes
+// and UUIDs; anything larger belongs in `bytes`.
+const maxFixedSchemaSize = 1 << 24 // 16 MiB
+
 // NewFixedSchema creates a new fixed schema instance.
 func NewFixedSchema(
 	name, namespace string,
@@ -1367,6 +1461,9 @@ func NewFixedSchema(
 
 	if size < 0 {
 		return nil, errors.New("avro: fixed size cannot be negative")
+	}
+	if size > maxFixedSchemaSize {
+		return nil, fmt.Errorf("avro: fixed size %d is greater than the maximum %d", size, maxFixedSchemaSize)
 	}
 
 	reservedProps := fixedReserved

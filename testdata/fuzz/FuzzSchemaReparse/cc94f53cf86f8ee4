@@ -1,0 +1,2 @@
+go test fuzz v1
+string("{\"type\":\"record\",\"nAme\":\"A\",\"fields\":[{\"nAme\":\"A\",\"tYpe\":{\"type\":\"fixed\",\"nAme\":\"B\",\"siZe\":0},\"defAult\":\"\"}]}")

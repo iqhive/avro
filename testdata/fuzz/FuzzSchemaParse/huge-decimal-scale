@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":999999999,\"scale\":999999999}")

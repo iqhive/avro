@@ -202,6 +202,28 @@ func TestDecoder_RejectsHostileHeaderMapCount(t *testing.T) {
 	assert.Contains(t, err.Error(), "MaxMapAllocSize")
 }
 
+func TestDecoder_RejectsHugeFixedSizeInHeader(t *testing.T) {
+	// The header schema is untrusted input. Before the fixed size cap, this
+	// sixty-byte schema parsed fine and decoding a record into `any` tried
+	// to allocate a terabyte.
+	schema := `{"type":"record","name":"R","fields":[{"name":"f",
+		"type":{"type":"fixed","name":"F","size":1099511627776}}]}`
+
+	var hostile bytes.Buffer
+	hostile.WriteString("Obj\x01")
+	writeZigZagLong(&hostile, 1) // one metadata entry
+	writeZigZagLong(&hostile, int64(len("avro.schema")))
+	hostile.WriteString("avro.schema")
+	writeZigZagLong(&hostile, int64(len(schema)))
+	hostile.WriteString(schema)
+	writeZigZagLong(&hostile, 0)    // end of the metadata map
+	hostile.Write(make([]byte, 16)) // sync marker
+
+	_, err := ocf.NewDecoder(bytes.NewReader(hostile.Bytes()))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "greater than the maximum")
+}
+
 // Run with -race: pins that a *zstd.Decoder shared via WithZStandardDecoder is safe under concurrent OCF decoders.
 // Regression guard for the old `defer decoder.Reset(nil)`, whose concurrent Reset(nil) calls raced on the shared decoder's state.
 func TestSharedZstdDecoder_Concurrent(t *testing.T) {

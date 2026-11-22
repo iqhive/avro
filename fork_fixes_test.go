@@ -6,6 +6,7 @@ package avro_test
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -863,5 +864,149 @@ func TestFix_VarintBeyondItsTypeIsAnError(t *testing.T) {
 			r.ReadNext(tc.schema)
 			assert.Error(t, r.Error, "ReadNext")
 		})
+	}
+}
+
+// A fixed schema could declare any size, and the library allocated that many
+// bytes: decoding a fixed into `any` made the whole array before a single
+// byte of data was read, and parsing a fixed field with a default made it at
+// schema-parse time. A sixty-byte schema from an untrusted OCF header or
+// schema registry could demand a terabyte. Fixed sizes are now capped.
+func TestFix_FixedSizeIsCapped(t *testing.T) {
+	const max = 1 << 24
+
+	_, err := avro.NewFixedSchema("F", "", max+1, nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "greater than the maximum")
+
+	fixed, err := avro.NewFixedSchema("F", "", max, nil)
+	require.NoError(t, err)
+	assert.Equal(t, max, fixed.Size())
+
+	for _, schema := range []string{
+		`{"type":"fixed","name":"F","size":68719476736}`,
+		`{"type":"record","name":"R","fields":[{"name":"f",
+			"type":{"type":"fixed","name":"F","size":1099511627776},"default":""}]}`,
+	} {
+		_, err := avro.Parse(schema)
+		require.Error(t, err, "%s", schema)
+		assert.ErrorContains(t, err, "greater than the maximum", "%s", schema)
+	}
+
+	// A fixed still decodes into `any`.
+	small := avro.MustParse(`{"type":"fixed","name":"F","size":4}`)
+	var got any
+	require.NoError(t, avro.Unmarshal(small, []byte{0xde, 0xad, 0xbe, 0xef}, &got))
+	assert.Equal(t, [4]byte{0xde, 0xad, 0xbe, 0xef}, got)
+}
+
+// A bytes.decimal could declare any precision, and with it any scale, and
+// decoding a value computed 10^scale from scratch: a schema from an
+// untrusted OCF header or schema registry with scale 999999999 spent
+// unbounded time and memory on every value decoded. Such a decimal is now
+// refused the way an invalid one always was, and the schema falls back to
+// plain bytes.
+func TestFix_BytesDecimalPrecisionIsCapped(t *testing.T) {
+	schema := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":999999999,"scale":999999998}`)
+
+	// The logical type is dropped, so the value decodes as plain bytes.
+	var got any
+	require.NoError(t, avro.Unmarshal(schema, []byte{0x02, 0xff}, &got))
+	assert.Equal(t, []byte{0xff}, got)
+
+	// The same holds for a fixed.decimal whose precision the cap, not the
+	// physical size, rejects: a 41600-byte fixed can hold 100000 digits, but
+	// the cap stops at the same place it does for bytes.
+	fixed := avro.MustParse(`{"type":"fixed","name":"F","size":41600,
+		"logicalType":"decimal","precision":100001,"scale":100001}`)
+	assert.Nil(t, fixed.(*avro.FixedSchema).Logical())
+
+	// A decimal at the cap is still a decimal.
+	atCap := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":100000,"scale":100000}`)
+	assert.Equal(t, avro.Decimal, atCap.(*avro.PrimitiveSchema).Logical().Type())
+	var rat any
+	require.NoError(t, avro.Unmarshal(atCap, []byte{0x00}, &rat))
+	assert.Equal(t, big.NewRat(0, 1), rat)
+}
+
+// The decimal cap also holds where a decimal is used rather than parsed, so
+// a schema built in Go cannot bypass it: decoding or encoding with a scale
+// past the cap is an error, not unbounded work.
+func TestFix_DecimalScaleCappedWhereUsed(t *testing.T) {
+	bytesDec := avro.NewPrimitiveSchema(avro.Bytes, avro.NewDecimalLogicalSchema(200000, 200000))
+	fixedDec, err := avro.NewFixedSchema("F", "", 4, avro.NewDecimalLogicalSchema(200000, 200000))
+	require.NoError(t, err)
+
+	var got any
+	err = avro.Unmarshal(bytesDec, []byte{0x00}, &got)
+	assert.Error(t, err, "decode bytes.decimal into any")
+	assert.ErrorContains(t, err, "greater than the maximum")
+
+	var rat big.Rat
+	err = avro.Unmarshal(bytesDec, []byte{0x00}, &rat)
+	assert.ErrorContains(t, err, "greater than the maximum", "decode bytes.decimal into big.Rat")
+
+	err = avro.Unmarshal(fixedDec, []byte{0x80, 0x00, 0x00, 0x00}, &got)
+	assert.ErrorContains(t, err, "greater than the maximum", "decode fixed.decimal")
+
+	r := avro.NewReader(nil, 0).Reset([]byte{0x00})
+	assert.Nil(t, r.ReadNext(bytesDec), "ReadNext")
+	assert.Error(t, r.Error, "ReadNext")
+
+	_, err = avro.Marshal(bytesDec, big.NewRat(1, 4))
+	assert.Error(t, err, "encode bytes.decimal from *big.Rat")
+
+	_, err = avro.Marshal(bytesDec, *big.NewRat(1, 4))
+	assert.Error(t, err, "encode bytes.decimal from big.Rat")
+
+	_, err = avro.Marshal(fixedDec, big.NewRat(1, 4))
+	assert.Error(t, err, "encode fixed.decimal")
+}
+
+// FuzzSchemaReparse found a schema that parsed but whose marshalled form did
+// not parse back: MarshalJSON wrote a fixed default, which parse stores as a
+// [size]byte, as a JSON array, and a bytes default as a base64 string, but
+// the specification defines both as JSON strings whose Unicode code points
+// 0-255 map to byte values 0-255. A bytes default also re-parsed to different
+// bytes, silently. The fuzzer's input is kept as a corpus seed at
+// testdata/fuzz/FuzzSchemaReparse/cc94f53cf86f8ee4.
+func TestFix_MarshalledDefaultsParseBack(t *testing.T) {
+	s := avro.MustParse(`{
+		"type": "record",
+		"name": "R",
+		"fields": [
+			{"name": "zero", "type": {"type": "fixed", "name": "Zero", "size": 0}, "default": ""},
+			{"name": "fix",  "type": {"type": "fixed", "name": "Fix",  "size": 3}, "default": "ab\u0000"},
+			{"name": "by",   "type": "bytes", "default": "\u00ffx"},
+			{"name": "arr",  "type": {"type": "array", "items": "bytes"}, "default": ["ab"]},
+			{"name": "m",    "type": {"type": "map", "values": {"type": "fixed", "name": "MF", "size": 2}}, "default": {"k": "ab"}}
+		]
+	}`)
+
+	full, err := json.Marshal(s)
+	require.NoError(t, err)
+
+	// Bytes and fixed defaults are strings, one code point per byte, not
+	// arrays or base64, and bytes over 0x7f escape so they reparse as the
+	// same byte.
+	assert.Contains(t, string(full), `"default":""`)
+	assert.Contains(t, string(full), `"default":"ab\u0000"`)
+	assert.Contains(t, string(full), `"default":"\u00ffx"`)
+	assert.Contains(t, string(full), `"default":["ab"]`)
+	assert.Contains(t, string(full), `"default":{"k":"ab"}`)
+	assert.NotContains(t, string(full), "YWI=")
+
+	reparsed, err := avro.Parse(string(full))
+	require.NoError(t, err)
+
+	again, err := json.Marshal(reparsed)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(full), string(again))
+
+	want := s.(*avro.RecordSchema)
+	got := reparsed.(*avro.RecordSchema)
+	require.Len(t, got.Fields(), len(want.Fields()))
+	for i, field := range want.Fields() {
+		assert.Equal(t, field.Default(), got.Fields()[i].Default(), "field %s", field.Name())
 	}
 }

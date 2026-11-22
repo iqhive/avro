@@ -754,17 +754,32 @@ type bytesDecimalCodec struct {
 // *big.Rat): it sets the value, rather than storing a pointer over it.
 func (c *bytesDecimalCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	b := r.ReadBytes()
-	(*big.Rat)(ptr).Set(ratFromBytes(b, c.scale))
+	rat := ratFromBytes(r, b, c.scale)
+	if rat == nil {
+		return
+	}
+	(*big.Rat)(ptr).Set(rat)
 }
 
 // unscaled returns r times 10^scale, truncated toward zero, as positive
 // values always were: big.Int's Div rounds a negative value away from zero.
-func unscaled(r *big.Rat, scale int) *big.Int {
+// It returns nil after reporting a scale past the maximum on w.
+func unscaled(w *Writer, r *big.Rat, scale int) *big.Int {
+	if scale > maxDecimalPrecision {
+		w.Error = fmt.Errorf("avro: cannot encode decimal: scale %d is greater than the maximum %d", scale, maxDecimalPrecision)
+		return nil
+	}
 	i := new(big.Int).Mul(r.Num(), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
 	return i.Quo(i, r.Denom())
 }
 
-func ratFromBytes(b []byte, scale int) *big.Rat {
+// ratFromBytes decodes b as a two's-complement unscaled value scaled by
+// 10^scale. It returns nil after reporting a scale past the maximum on r.
+func ratFromBytes(r *Reader, b []byte, scale int) *big.Rat {
+	if scale > maxDecimalPrecision {
+		r.ReportError("decode decimal", fmt.Sprintf("scale %d is greater than the maximum %d", scale, maxDecimalPrecision))
+		return nil
+	}
 	num := (&big.Int{}).SetBytes(b)
 	if len(b) > 0 && b[0]&0x80 > 0 {
 		num.Sub(num, new(big.Int).Lsh(one, uint(len(b))*8))
@@ -775,7 +790,10 @@ func ratFromBytes(b []byte, scale int) *big.Rat {
 
 func (c *bytesDecimalCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	r := (*big.Rat)(ptr)
-	i := unscaled(r, c.scale)
+	i := unscaled(w, r, c.scale)
+	if i == nil {
+		return
+	}
 
 	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
 		w.Error = fmt.Errorf(
@@ -811,11 +829,7 @@ type bytesDecimalPtrCodec struct {
 }
 
 func (c *bytesDecimalPtrCodec) Decode(ptr unsafe.Pointer, r *Reader) {
-	b := r.ReadBytes()
-	if i := (&big.Int{}).SetBytes(b); len(b) > 0 && b[0]&0x80 > 0 {
-		i.Sub(i, new(big.Int).Lsh(one, uint(len(b))*8))
-	}
-	*(**big.Rat)(ptr) = ratFromBytes(b, c.scale)
+	*(**big.Rat)(ptr) = ratFromBytes(r, r.ReadBytes(), c.scale)
 }
 
 func (c *bytesDecimalPtrCodec) Encode(ptr unsafe.Pointer, w *Writer) {
@@ -824,7 +838,10 @@ func (c *bytesDecimalPtrCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 		w.Error = errors.New("avro: cannot encode a nil *big.Rat as Avro bytes.decimal")
 		return
 	}
-	i := unscaled(r, c.scale)
+	i := unscaled(w, r, c.scale)
+	if i == nil {
+		return
+	}
 
 	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
 		w.Error = fmt.Errorf(
