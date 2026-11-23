@@ -63,7 +63,8 @@ func (c *TypedCodec[T]) AppendEncode(dst []byte, v T) ([]byte, error) {
 }
 
 // Decode unmarshals a typed value from SOE-encoded Avro binary, and fails if
-// the schema fingerprint doesn't match the held schema.
+// the schema fingerprint doesn't match the held schema (either fingerprint
+// Codec.Decode takes).
 func (c *TypedCodec[T]) Decode(data []byte, v T) error {
 	return c.codec.Decode(data, v)
 }

@@ -12,7 +12,10 @@ import (
 var Magic = []byte{0xc3, 0x01}
 
 // ComputeFingerprint returns an SOE-compatible (CRC64, little-endian) schema
-// fingerprint.
+// fingerprint. It is taken over schema.String(), which keeps logical types,
+// so for a schema with one it is not the fingerprint of the Parsing Canonical
+// Form that Java's SchemaNormalization computes. Codec.Decode and
+// resolvers.MemorySchemaStore take both.
 func ComputeFingerprint(schema avro.Schema) ([]byte, error) {
 	return schema.FingerprintUsing(avro.CRC64AvroLE)
 }

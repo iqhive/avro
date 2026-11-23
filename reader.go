@@ -38,7 +38,17 @@ type Reader struct {
 	head   int
 	tail   int
 	depth  int
-	Error  error
+	// offset is how many bytes of the input came before buf, so offset + head
+	// is the position in the input.
+	offset int64
+	// valueStart is where the outermost value being read began, valuePaid how
+	// many array elements that take no bytes it has paid for with its own
+	// bytes, and slackUsed how much of the slack the Reader's values have
+	// used since NewReader or Reset: see takeNoBytes.
+	valueStart int64
+	valuePaid  int64
+	slackUsed  int64
+	Error      error
 }
 
 // NewReader creates a new Reader.
@@ -61,19 +71,28 @@ func (r *Reader) Reset(b []byte) *Reader {
 	r.head = 0
 	r.tail = len(b)
 	r.depth = 0
+	r.offset = 0
+	r.valueStart = 0
+	r.valuePaid = 0
+	r.slackUsed = 0
 	r.Error = nil
 	return r
 }
 
-// enter counts one more level of record nesting and reports whether it is
-// within Config.MaxDepth. Past it, it records errMaxDepth and the level is not
-// counted, so a caller that gets false must not call leave.
+// enter counts one more level of nesting (a record, an array or a map) and
+// reports whether it is within Config.MaxDepth. Past it, it records
+// errMaxDepth and the level is not counted, so a caller that gets false must
+// not call leave. The first level is the start of a value.
 func (r *Reader) enter() bool {
 	if r.depth >= r.cfg.getMaxDepth() {
 		if r.Error == nil {
 			r.Error = errMaxDepth
 		}
 		return false
+	}
+	if r.depth == 0 {
+		r.valueStart = r.position()
+		r.valuePaid = 0
 	}
 	r.depth++
 	return true
@@ -82,6 +101,42 @@ func (r *Reader) enter() bool {
 // leave ends a level that enter counted.
 func (r *Reader) leave() {
 	r.depth--
+}
+
+// position returns how many bytes of the input have been read.
+func (r *Reader) position() int64 {
+	return r.offset + int64(r.head)
+}
+
+// noBytesPerByte is how many array elements that take no bytes each byte of a
+// value pays for. This library writes such arrays in blocks of at most
+// maxNoBytesBlock, one byte of count each, so its own output always stays
+// within it.
+const noBytesPerByte = 8
+
+// takeNoBytes counts n more array elements that take no bytes of the input
+// (nulls, empty records, fixeds of size 0) and reports whether the Reader may
+// read them. Such elements cost no input, so unbounded, a block count alone
+// would make the decoder allocate memory, and spend time, that the data does
+// not fill. A value pays for noBytesPerByte of them with each of its own
+// bytes. Past that it draws on a slack of minArrayGrowth (lowered, never
+// raised, by Config.MaxSliceAllocSize) that the Reader's values share since
+// NewReader or Reset: one value for Unmarshal, the whole stream for a Decoder,
+// one block for the OCF decoder. So a value holds at most what its own bytes
+// pay for plus the slack, whatever came before it, and a stream of tiny values
+// cannot claim the slack again in each one. Past that it records an error.
+func (r *Reader) takeNoBytes(n int) bool {
+	credit := max(0, noBytesPerByte*(r.position()-r.valueStart)-r.valuePaid)
+	paid := min(int64(n), credit)
+	draw := int64(n) - paid
+	if draw > r.cfg.getNoBytesSlack()-r.slackUsed {
+		r.ReportError("decode array", "more elements that take no bytes than the value pays for "+
+			"(8 a byte, plus 1024 for the input)")
+		return false
+	}
+	r.valuePaid += paid
+	r.slackUsed += draw
+	return true
 }
 
 // ReportError record an error in iterator instance with current position.
@@ -114,6 +169,7 @@ func (r *Reader) loadMore() bool {
 			continue
 		}
 
+		r.offset += int64(r.head)
 		r.head = 0
 		r.tail = n
 		return true
@@ -141,7 +197,7 @@ func (r *Reader) readByte() byte {
 //go:noinline
 func (r *Reader) readByteSlow() byte {
 	if !r.loadMore() {
-		r.Error = io.ErrUnexpectedEOF
+		r.Error = cutShort(r.Error)
 		return 0
 	}
 
@@ -170,7 +226,7 @@ func (r *Reader) Read(b []byte) {
 	for read < size {
 		if r.head == r.tail {
 			if !r.loadMore() {
-				r.Error = io.ErrUnexpectedEOF
+				r.Error = cutShort(r.Error)
 				return
 			}
 		}

@@ -50,8 +50,8 @@ func (w *Writer) Reset(out io.Writer) {
 	w.Error = nil
 }
 
-// enter counts one more level of record nesting and reports whether it is
-// within Config.MaxDepth. Past it, it records errMaxDepth and the level is not
+// enter counts one more level of nesting (a record, an array or a map) and
+// reports whether it is within Config.MaxDepth. Past it, it records errMaxDepth and the level is not
 // counted, so a caller that gets false must not call leave.
 func (w *Writer) enter() bool {
 	if w.depth >= w.cfg.getMaxDepth() {

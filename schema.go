@@ -355,7 +355,7 @@ func (i *cacheFingerprinter) CacheFingerprint(schema Schema, fn func() []byte) [
 
 	fp := schema.Fingerprint()
 	refs := externalRefsIdentity(schema)
-	defs := defaultsIdentity(schema)
+	defs := codecIdentity(schema)
 	if i.writerFingerprint == nil && len(refs) == 0 && len(defs) == 0 {
 		i.cache.Store(fp)
 		return fp
@@ -1791,6 +1791,11 @@ func validateDefault(name string, schema Schema, def any) (any, error) {
 	return def, nil
 }
 
+// float32Overflow is halfway between math.MaxFloat32 and 2^128: a float64 at
+// or past it rounds to infinity as a float32, and one below it rounds to a
+// finite float32.
+const float32Overflow = 0x1.ffffffp127
+
 func defaultJSONInteger(value json.Number, allowFraction bool) (*big.Int, bool) {
 	if i, err := value.Int64(); err == nil {
 		return big.NewInt(i), true
@@ -1914,14 +1919,17 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 			return def, !math.IsInf(float64(f), 0) && !math.IsNaN(float64(f))
 		}
 		if value, ok := def.(json.Number); ok {
-			f, err := value.Float64()
-			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < -math.MaxFloat32 || f > math.MaxFloat32 {
+			// Parsed straight to a float32, the decimal rounds as Java and
+			// Go print it: math.MaxFloat32 is written 3.4028235e38, which
+			// is above it as a float64.
+			f, err := strconv.ParseFloat(value.String(), 32)
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 				return nil, false
 			}
 			return float32(f), true
 		}
 		if f, ok := def.(float64); ok {
-			if math.IsNaN(f) || math.IsInf(f, 0) || f < -math.MaxFloat32 || f > math.MaxFloat32 {
+			if math.IsNaN(f) || math.Abs(f) >= float32Overflow {
 				return nil, false
 			}
 			return float32(f), true

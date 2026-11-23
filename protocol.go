@@ -242,7 +242,7 @@ func ParseProtocol(protocol string) (*Protocol, error) {
 	cache := &SchemaCache{}
 
 	var m map[string]any
-	if err := json.Unmarshal([]byte(protocol), &m); err != nil {
+	if err := unmarshalSchemaJSON([]byte(protocol), &m); err != nil {
 		return nil, err
 	}
 

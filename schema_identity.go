@@ -31,15 +31,18 @@ func appendExternalRefs(identity []byte, schema Schema, seen map[NamedSchema]str
 	return identity
 }
 
-// defaultsIdentity returns the field defaults of every record schema reaches,
-// as JSON, or nil if none has one. Encoders write a default for a field the Go
-// value does not have, and the canonical form behind Fingerprint leaves
-// defaults out, so the cache identity must add them.
-func defaultsIdentity(schema Schema) []byte {
-	return appendDefaults(nil, schema, map[NamedSchema]struct{}{})
+// codecIdentity returns what the canonical form behind Fingerprint leaves out
+// and the codecs use, as text, or nil if the schema has none of it: the field
+// defaults and field aliases of every record schema reaches, and the default
+// of every enum. Encoders write a default for a field the Go value does not
+// have, the struct decoder finds a Go field by a schema field's aliases, and a
+// resolved enum reads a symbol the reader lacks as its default, so the cache
+// identity must add them.
+func codecIdentity(schema Schema) []byte {
+	return appendCodecIdentity(nil, schema, map[NamedSchema]struct{}{})
 }
 
-func appendDefaults(identity []byte, schema Schema, seen map[NamedSchema]struct{}) []byte {
+func appendCodecIdentity(identity []byte, schema Schema, seen map[NamedSchema]struct{}) []byte {
 	if ref, ok := schema.(*RefSchema); ok {
 		schema = ref.Schema()
 	}
@@ -49,8 +52,12 @@ func appendDefaults(identity []byte, schema Schema, seen map[NamedSchema]struct{
 		}
 		seen[named] = struct{}{}
 	}
-	if rec, ok := schema.(*RecordSchema); ok {
-		for _, f := range rec.Fields() {
+	switch s := schema.(type) {
+	case *RecordSchema:
+		for _, f := range s.Fields() {
+			if len(f.Aliases()) > 0 {
+				identity = fmt.Appendf(identity, "%s.%s aliases %q;", s.FullName(), f.Name(), f.Aliases())
+			}
 			if !f.HasDefault() {
 				continue
 			}
@@ -58,11 +65,15 @@ func appendDefaults(identity []byte, schema Schema, seen map[NamedSchema]struct{
 			if err != nil {
 				def = []byte(fmt.Sprintf("%#v", f.Default()))
 			}
-			identity = fmt.Appendf(identity, "%s.%s=%s;", rec.FullName(), f.Name(), def)
+			identity = fmt.Appendf(identity, "%s.%s=%s;", s.FullName(), f.Name(), def)
+		}
+	case *EnumSchema:
+		if s.HasDefault() {
+			identity = fmt.Appendf(identity, "%s default %q;", s.FullName(), s.Default())
 		}
 	}
 	for _, child := range schemaChildren(schema) {
-		identity = appendDefaults(identity, child, seen)
+		identity = appendCodecIdentity(identity, child, seen)
 	}
 	return identity
 }

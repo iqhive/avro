@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/iqhive/avro/v2"
+	"github.com/iqhive/avro/v2/soe/internal/canonical"
 )
 
 // Codec marshals values to/from bytes, with the Avro binary payload wrapped in
@@ -13,6 +14,8 @@ type Codec struct {
 	api    avro.API
 	schema avro.Schema
 	header []byte
+	// canonical is Java's fingerprint of schema (see Decode).
+	canonical []byte
 }
 
 // NewCodec creates a new Codec for a Schema and the default config.
@@ -28,9 +31,10 @@ func NewCodecWithAPI(schema avro.Schema, api avro.API) (*Codec, error) {
 		return nil, err
 	}
 	return &Codec{
-		schema: schema,
-		api:    api,
-		header: header,
+		schema:    schema,
+		api:       api,
+		header:    header,
+		canonical: canonical.Fingerprint(schema),
 	}, nil
 }
 
@@ -57,14 +61,19 @@ func (c *Codec) AppendEncode(dst []byte, v any) ([]byte, error) {
 }
 
 // Decode unmarshals a value from SOE-encoded Avro binary, and fails if
-// the schema fingerprint doesn't match the held schema.
+// the schema fingerprint doesn't match the held schema. Two fingerprints
+// match: the one Encode writes (ComputeFingerprint), and the one Java's
+// SchemaNormalization computes over the schema's Parsing Canonical Form,
+// which leaves logical types out. Python's avro and goavro write a primitive
+// with a logical type as {"type":"long"} in that form, so for such a schema
+// their fingerprint is neither.
 func (c *Codec) Decode(data []byte, v any) error {
 	fingerprint, data, err := ParseHeader(data)
 	if err != nil {
 		return err
 	}
 	expected := c.getFingerprint()
-	if !bytes.Equal(fingerprint, expected) {
+	if !bytes.Equal(fingerprint, expected) && !bytes.Equal(fingerprint, c.canonical) {
 		return fmt.Errorf("bad fingerprint %x, expected %x", fingerprint, expected)
 	}
 	return c.api.Unmarshal(c.schema, data, v)

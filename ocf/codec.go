@@ -46,12 +46,10 @@ func resolveCodec(name CodecName, codecOpts codecOptions) (Codec, error) {
 		return &NullCodec{}, nil
 
 	case Deflate:
-		w, err := flate.NewWriter(io.Discard, codecOpts.DeflateCompressionLevel)
-		if err != nil {
-			return nil, fmt.Errorf("deflate: %w", err)
-		}
-		if err := w.Close(); err != nil {
-			return nil, fmt.Errorf("deflate: %w", err)
+		// These are the levels flate.NewWriter accepts. Asking it instead
+		// builds a compressor of most of a megabyte, on every NewDecoder too.
+		if lvl := codecOpts.DeflateCompressionLevel; lvl < flate.HuffmanOnly || lvl > flate.BestCompression {
+			return nil, fmt.Errorf("deflate: invalid compression level %d", lvl)
 		}
 		return &DeflateCodec{
 			compLvl:         codecOpts.DeflateCompressionLevel,

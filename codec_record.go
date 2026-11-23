@@ -162,9 +162,7 @@ func (d *structDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		field.decoder.Decode(fieldPtr, r)
 
 		if r.Error != nil && !errors.Is(r.Error, io.EOF) {
-			if !isMaxDepth(r.Error) {
-				r.Error = fmt.Errorf("%s: %w", field.field[0].field.Name(), r.Error)
-			}
+			r.Error = withContext(r.Error, field.field[0].field.Name())
 			r.leave()
 			return
 		}
@@ -272,9 +270,7 @@ func (e *structEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		field.encoder.Encode(fieldPtr, w)
 
 		if w.Error != nil && !errors.Is(w.Error, io.EOF) {
-			if !isMaxDepth(w.Error) {
-				w.Error = fmt.Errorf("%s: %w", field.field[0].field.Name(), w.Error)
-			}
+			w.Error = withContext(w.Error, field.field[0].field.Name())
 			w.leave()
 			return
 		}
@@ -353,8 +349,8 @@ func (d *recordMapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		d.mapType.UnsafeSetIndex(ptr, reflect2.PtrOf(field), elemPtr)
 	}
 
-	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !isMaxDepth(r.Error) {
-		r.Error = fmt.Errorf("%v: %w", d.mapType, r.Error)
+	if r.Error != nil && !errors.Is(r.Error, io.EOF) {
+		r.Error = withContext(r.Error, d.mapType.String())
 	}
 	r.leave()
 }
@@ -441,9 +437,7 @@ func (e *recordMapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		field.encoder.Encode(valPtr, w)
 
 		if w.Error != nil && !errors.Is(w.Error, io.EOF) {
-			if !isMaxDepth(w.Error) {
-				w.Error = fmt.Errorf("%s: %w", field.name, w.Error)
-			}
+			w.Error = withContext(w.Error, field.name)
 			w.leave()
 			return
 		}

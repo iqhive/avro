@@ -74,21 +74,7 @@ func ParseBytes(schema []byte) (Schema, error) {
 // ParseBytesWithCache parses a schema byte slice using the given namespace and schema cache.
 func ParseBytesWithCache(schema []byte, namespace string, cache *SchemaCache) (Schema, error) {
 	var parsed any
-	decoder := json.NewDecoder(bytes.NewReader(schema))
-	decoder.UseNumber()
-	err := decoder.Decode(&parsed)
-	if err == nil {
-		// Match json.Unmarshal's rejection of a second JSON value or other
-		// trailing content instead of accepting a valid prefix.
-		var trailing any
-		err = decoder.Decode(&trailing)
-		if err == io.EOF {
-			err = nil
-		} else if err == nil {
-			err = errors.New("avro: multiple JSON values in schema")
-		}
-	}
-	if err != nil {
+	if err := unmarshalSchemaJSON(schema, &parsed); err != nil {
 		parsed = string(schema)
 	}
 
@@ -104,6 +90,27 @@ func ParseBytesWithCache(schema []byte, namespace string, cache *SchemaCache) (S
 	cache.AddAll(internalCache)
 
 	return derefSchema(s), nil
+}
+
+// unmarshalSchemaJSON decodes the JSON of a schema or protocol into v with
+// its numbers kept as json.Number, so defaults are checked and converted
+// exactly rather than through float64. Like json.Unmarshal, it refuses
+// anything after the value.
+func unmarshalSchemaJSON(data []byte, v any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(v); err != nil {
+		return err
+	}
+	var trailing any
+	switch err := decoder.Decode(&trailing); {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err == nil:
+		return errors.New("avro: multiple JSON values in schema")
+	default:
+		return err
+	}
 }
 
 func parseType(namespace string, v any, seen seenCache, cache *SchemaCache) (Schema, error) {
@@ -289,17 +296,8 @@ func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, c
 
 	ref := NewRefSchema(rec)
 	cache.Add(rec.FullName(), ref)
-	for _, alias := range rec.Aliases() {
-		if alias == rec.FullName() {
-			continue
-		}
-		if cache.Get(alias) != nil {
-			return nil, fmt.Errorf("avro: alias %q conflicts with an existing schema name", alias)
-		}
-		if err := seen.Add(alias); err != nil {
-			return nil, err
-		}
-		cache.Add(alias, ref)
+	if err := addAliases(rec, ref, seen, cache); err != nil {
+		return nil, err
 	}
 
 	fieldNames := make(map[string]struct{})
@@ -405,17 +403,8 @@ func parseEnum(namespace string, m map[string]any, seen seenCache, cache *Schema
 
 	ref := NewRefSchema(enum)
 	cache.Add(enum.FullName(), ref)
-	for _, alias := range enum.Aliases() {
-		if alias == enum.FullName() {
-			continue
-		}
-		if cache.Get(alias) != nil {
-			return nil, fmt.Errorf("avro: alias %q conflicts with an existing schema name", alias)
-		}
-		if err := seen.Add(alias); err != nil {
-			return nil, err
-		}
-		cache.Add(alias, enum)
+	if err := addAliases(enum, enum, seen, cache); err != nil {
+		return nil, err
 	}
 
 	return enum, nil
@@ -571,17 +560,8 @@ func parseFixed(namespace string, m map[string]any, seen seenCache, cache *Schem
 
 	ref := NewRefSchema(fixed)
 	cache.Add(fixed.FullName(), ref)
-	for _, alias := range fixed.Aliases() {
-		if alias == fixed.FullName() {
-			continue
-		}
-		if cache.Get(alias) != nil {
-			return nil, fmt.Errorf("avro: alias %q conflicts with an existing schema name", alias)
-		}
-		if err := seen.Add(alias); err != nil {
-			return nil, err
-		}
-		cache.Add(alias, fixed)
+	if err := addAliases(fixed, fixed, seen, cache); err != nil {
+		return nil, err
 	}
 
 	return fixed, nil
@@ -742,6 +722,42 @@ func (c seenCache) Add(name string) error {
 	}
 	c[name] = struct{}{}
 	return nil
+}
+
+// addAliases registers the aliases of schema, which the cache holds as entry
+// under its full name. An alias may not repeat a name or an alias seen in
+// this parse, because a reference by that name would then change what it
+// refers to. A name that an earlier parse defined keeps its type and the
+// alias is left out, as when a reader renames the writer's record and keeps
+// the old name as an alias. An alias that an earlier parse registered is
+// replaced, as when a schema is parsed again.
+func addAliases(schema NamedSchema, entry Schema, seen seenCache, cache *SchemaCache) error {
+	aliases := schema.Aliases()
+	listed := make(map[string]struct{}, len(aliases))
+	for _, alias := range aliases {
+		if _, twice := listed[alias]; twice || alias == schema.FullName() {
+			continue
+		}
+		listed[alias] = struct{}{}
+		if err := seen.Add(alias); err != nil {
+			return fmt.Errorf("avro: alias %q conflicts with an existing schema name", alias)
+		}
+		if existing := cache.Get(alias); existing != nil && definesName(existing, alias) {
+			continue
+		}
+		cache.Add(alias, entry)
+	}
+	return nil
+}
+
+// definesName reports whether schema is the type called name, rather than a
+// type that has name as an alias.
+func definesName(schema Schema, name string) bool {
+	if ref, ok := schema.(*RefSchema); ok {
+		schema = ref.Schema()
+	}
+	named, ok := schema.(NamedSchema)
+	return ok && named.FullName() == name
 }
 
 func logicalTypeProperty(props map[string]any) string {

@@ -283,6 +283,13 @@ type Generator struct {
 	typedefs          []typedef
 	typeenums         []typeenum
 	nameCaser         *strcase.Caser
+
+	// typeNames maps each Go type name given to a record or an enum to the
+	// full name of the Avro type it was given for.
+	typeNames map[string]string
+	// nameClashes holds the Avro types that would share a Go type, which
+	// Write reports.
+	nameClashes []string
 }
 
 // NewGenerator returns a generator.
@@ -320,6 +327,8 @@ func (g *Generator) Reset() {
 	g.thirdPartyImports = g.thirdPartyImports[:0]
 	g.typedefs = g.typedefs[:0]
 	clear(g.usedFieldTypes)
+	clear(g.typeNames)
+	g.nameClashes = g.nameClashes[:0]
 }
 
 // Parse parses an avro schema into Go types.
@@ -373,6 +382,7 @@ func (g *Generator) generate(schema avro.Schema, metadata any) string {
 }
 
 func (g *Generator) resolveEnum(s *avro.EnumSchema) string {
+	g.claimTypeName(s.Name(), s.FullName())
 	if !g.hasTypeEnum(s.Name()) {
 		g.typeenums = append(g.typeenums, newTypeEnum(s.Name(), s.Symbols()))
 	}
@@ -404,6 +414,7 @@ func (g *Generator) resolveRecordSchema(schema *avro.RecordSchema, metadata any)
 	}
 
 	typeName := g.resolveTypeName(schema)
+	g.claimTypeName(typeName, schema.FullName())
 	if !g.hasTypeDef(typeName) {
 		g.typedefs = append(
 			g.typedefs,
@@ -447,6 +458,28 @@ func (g *Generator) rawSchema(schema *avro.RecordSchema) string {
 		return string(schemaJSON)
 	}
 	return schema.String()
+}
+
+// claimTypeName records that the Go type name stands for the Avro type
+// fullName. Only the first Avro type given a Go name gets a Go type, so a
+// second one with the same name would be decoded into the first's type, its
+// own fields or symbols lost: Write reports it instead.
+func (g *Generator) claimTypeName(name, fullName string) {
+	prev, ok := g.typeNames[name]
+	if !ok {
+		if g.typeNames == nil {
+			g.typeNames = map[string]string{}
+		}
+		g.typeNames[name] = fullName
+		return
+	}
+	if prev == fullName {
+		return
+	}
+	clash := fmt.Sprintf("%s and %s would both be Go type %s", prev, fullName, name)
+	if !slices.Contains(g.nameClashes, clash) {
+		g.nameClashes = append(g.nameClashes, clash)
+	}
 }
 
 func (g *Generator) hasTypeDef(name string) bool {
@@ -543,8 +576,17 @@ func (g *Generator) addImports(stdImport, thirdPartyImport string) {
 	}
 }
 
-// Write writes Go code from the parsed schemas.
+// Write writes Go code from the parsed schemas. It fails if two Avro types
+// would become one Go type.
 func (g *Generator) Write(w io.Writer) error {
+	if len(g.nameClashes) > 0 {
+		hint := "rename one, or for records set FullName"
+		if g.fullName {
+			hint = "rename one"
+		}
+		return fmt.Errorf("gen: %s; %s", strings.Join(g.nameClashes, "; "), hint)
+	}
+
 	parsed, err := template.New("out").
 		Funcs(template.FuncMap{
 			"kebab":      strcase.ToKebab,

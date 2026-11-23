@@ -61,6 +61,10 @@ type Config struct {
 	// MaxSliceAllocSize is the maximum size that the decoder will allocate, set to the max heap
 	// allocation size by default.
 	// If this size is exceeded, the decoder returns an error.
+	// Array elements that take no bytes (nulls, empty records, fixeds of size 0) cost no input, so
+	// a value may hold at most 8 of them for each of its own bytes, plus a slack of 1024 (or of
+	// MaxSliceAllocSize when that is smaller) that the values of one Unmarshal, one Decoder's
+	// stream or one OCF block share.
 	MaxSliceAllocSize int
 
 	// MaxMapAllocSize is the maximum size that the decoder will allocate, set to the max heap
@@ -68,12 +72,14 @@ type Config struct {
 	// If this size is exceeded, the decoder returns an error.
 	MaxMapAllocSize int
 
-	// MaxDepth is how deeply records may nest in a value being decoded or
-	// encoded, which only a recursive schema lets grow without bound. This
-	// defaults to 10000. Past it the decoder or encoder returns an error: each
-	// level is a step of Go recursion, so with no limit a small message for a
-	// recursive schema, or a Go value that refers to itself, would overflow the
-	// goroutine stack, which ends the program.
+	// MaxDepth is how deeply records, arrays and maps may nest in a value
+	// being decoded or encoded, each counting as one level; only a recursive
+	// schema lets nesting grow without bound. This defaults to 10000, so a
+	// tree whose records hold their children in an array or a map (two levels
+	// a record) nests 5000 records deep. Past it the decoder or encoder returns
+	// an error: each level is a step of Go recursion, so with no limit a small
+	// message for a recursive schema, or a Go value that refers to itself,
+	// would overflow the goroutine stack, which ends the program.
 	MaxDepth int
 
 	// SlabSize is the size of the byte slab used by the Reader for small string/bytes allocations.
@@ -329,6 +335,15 @@ func (c *frozenConfig) getMaxSliceAllocSize() int {
 		return maxAllocSize
 	}
 	return size
+}
+
+// getNoBytesSlack returns how many array elements that take no bytes a Reader
+// may read beyond what its bytes pay for: minArrayGrowth, the slack every
+// array has ahead of its data, or MaxSliceAllocSize when that is smaller. A
+// larger MaxSliceAllocSize must not raise it: set to its default or past it,
+// it would let a few bytes claim millions of such elements again.
+func (c *frozenConfig) getNoBytesSlack() int64 {
+	return int64(min(minArrayGrowth, c.getMaxSliceAllocSize()))
 }
 
 func (c *frozenConfig) getMaxMapAllocSize() int {

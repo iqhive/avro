@@ -29,7 +29,10 @@ func NewDecoderForSchema(schema Schema, reader io.Reader) *Decoder {
 func (d *Decoder) Decode(v any) error {
 	if d.r.head == d.r.tail && d.r.reader != nil {
 		if !d.r.loadMore() {
-			return io.EOF
+			// io.EOF is the input ending between values, the end of the
+			// stream; any other error is the reader failing, and the caller
+			// must see it.
+			return d.r.Error
 		}
 	}
 

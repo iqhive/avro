@@ -9,8 +9,17 @@ func createSkipDecoder(schema Schema) ValDecoder {
 	return createSkipDecoderWithCache(schema, make(map[[32]byte]ValDecoder))
 }
 
+// createSkipDecoderWithCache skips schema as the writer wrote it: a schema
+// resolved against a writer's holds the reader's shape, and a skip must read
+// the writer's bytes.
 func createSkipDecoderWithCache(schema Schema, cache map[[32]byte]ValDecoder) ValDecoder {
-	switch schema.Type() {
+	typ := schema.Type()
+	if prim, ok := schema.(*PrimitiveSchema); ok && prim.encodedType != "" {
+		// A promoted primitive (an int read as a double) was written as the
+		// writer's type.
+		typ = prim.encodedType
+	}
+	switch typ {
 	case Null:
 		// A null takes no bytes.
 		return &nullCodec{}
@@ -119,18 +128,48 @@ func (c *bytesSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
 func skipDecoderOfRecord(schema Schema, cache map[[32]byte]ValDecoder) ValDecoder {
 	rec := schema.(*RecordSchema)
 
-	decoders := make([]ValDecoder, len(rec.Fields()))
-	for i, field := range rec.Fields() {
-		decoders[i] = createSkipDecoderWithCache(field.Type(), cache)
+	decoders := make([]ValDecoder, 0, len(rec.Fields()))
+	noBytes := true
+	for _, field := range rec.Fields() {
+		// Resolution fills a field the writer lacks from its default: the
+		// data does not hold it.
+		if field.action == FieldSetDefault {
+			continue
+		}
+		decoder := createSkipDecoderWithCache(field.Type(), cache)
+		decoders = append(decoders, decoder)
+		noBytes = noBytes && skipsNoBytes(decoder)
 	}
 
 	return &recordSkipDecoder{
 		decoders: decoders,
+		noBytes:  noBytes,
 	}
 }
 
 type recordSkipDecoder struct {
 	decoders []ValDecoder
+	// noBytes is whether every field skips no bytes.
+	noBytes bool
+}
+
+// skipsNoBytes reports whether skip decoder d reads no bytes, whatever the
+// input holds. A record whose decoder is still being built (d is then its
+// deferDecoder with no decoder yet) is recursive, and with no union (which
+// takes a byte) in between it never ends: it counts as reading bytes.
+func skipsNoBytes(d ValDecoder) bool {
+	switch d := d.(type) {
+	case *nullCodec:
+		return true
+	case *fixedSkipDecoder:
+		return d.size == 0
+	case *recordSkipDecoder:
+		return d.noBytes
+	case *deferDecoder:
+		return d.decoder != nil && skipsNoBytes(d.decoder)
+	default:
+		return false
+	}
 }
 
 func (d *recordSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
@@ -160,21 +199,29 @@ func skipDecoderOfArray(schema Schema, cache map[[32]byte]ValDecoder) ValDecoder
 
 	return &sliceSkipDecoder{
 		decoder: decoder,
+		noBytes: skipsNoBytes(decoder),
 	}
 }
 
 type sliceSkipDecoder struct {
 	decoder ValDecoder
+	// noBytes is whether the elements skip no bytes.
+	noBytes bool
 }
 
 func (d *sliceSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
+	if !r.enter() {
+		return
+	}
 	for {
 		l, size := r.ReadBlockHeader()
 		if l == 0 {
 			break
 		}
 
-		if size > 0 {
+		// Elements that take no bytes leave nothing to skip, so a block of
+		// them is skipped in one step, whatever its count claims.
+		if size > 0 || d.noBytes {
 			r.SkipNBytes(size)
 			continue
 		}
@@ -186,6 +233,7 @@ func (d *sliceSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
 			}
 		}
 	}
+	r.leave()
 }
 
 func skipDecoderOfMap(schema Schema, cache map[[32]byte]ValDecoder) ValDecoder {
@@ -202,6 +250,9 @@ type mapSkipDecoder struct {
 }
 
 func (d *mapSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
+	if !r.enter() {
+		return
+	}
 	for {
 		l, size := r.ReadBlockHeader()
 		if l == 0 {
@@ -221,6 +272,7 @@ func (d *mapSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
 			}
 		}
 	}
+	r.leave()
 }
 
 func skipDecoderOfUnion(schema Schema, cache map[[32]byte]ValDecoder) ValDecoder {

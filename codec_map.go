@@ -48,6 +48,7 @@ func decoderOfMap(d *decoderContext, m *MapSchema, typ reflect2.Type) ValDecoder
 	return &mapDecoder{
 		mapType:  mapType,
 		elemType: mapType.Elem(),
+		zero:     mapType.Elem().UnsafeNew(),
 		decoder:  decoder,
 	}
 }
@@ -55,12 +56,21 @@ func decoderOfMap(d *decoderContext, m *MapSchema, typ reflect2.Type) ValDecoder
 type mapDecoder struct {
 	mapType  *reflect2.UnsafeMapType
 	elemType reflect2.Type
-	decoder  ValDecoder
+	// zero is a zero element, which nothing writes.
+	zero    unsafe.Pointer
+	decoder ValDecoder
 }
 
 func (d *mapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	var size int
 	isNil := d.mapType.UnsafeIsNil(ptr)
+	// Every value is decoded into elemPtr from the zero value and then copied
+	// into the map, so the value of a key the map already holds is a new one,
+	// as encoding/json makes it: decoded into the value held, it kept a
+	// nested map's old entries and the fields the schema does not name, and
+	// wrote over what the old value pointed at. One element serves the whole
+	// map, so the decode allocates no element per value.
+	var elemPtr unsafe.Pointer
 
 	for {
 		l, _ := r.ReadBlockHeader()
@@ -82,14 +92,15 @@ func (d *mapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		for range l {
 			keyPtr := reflect2.PtrOf(r.ReadString())
 
-			elemPtr := d.mapType.UnsafeGetIndex(ptr, keyPtr)
 			if elemPtr == nil {
 				elemPtr = d.elemType.UnsafeNew()
+			} else {
+				d.elemType.UnsafeSet(elemPtr, d.zero)
 			}
 
 			d.decoder.Decode(elemPtr, r)
 			if r.Error != nil {
-				if !isMaxDepth(r.Error) {
+				if !takesNoContext(r.Error) {
 					r.Error = fmt.Errorf("reading map[string]%s: %w", d.elemType.String(), r.Error)
 				}
 				return
@@ -103,7 +114,7 @@ func (d *mapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(0))
 	}
 
-	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !isMaxDepth(r.Error) {
+	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !takesNoContext(r.Error) {
 		r.Error = fmt.Errorf("%v: %w", d.mapType, r.Error)
 	}
 }
@@ -183,7 +194,7 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 			// Stop at an error: the block count came from the data, and an
 			// exhausted input would otherwise be read that many times over.
 			if r.Error != nil {
-				if !isMaxDepth(r.Error) {
+				if !takesNoContext(r.Error) {
 					r.Error = fmt.Errorf("reading %s: %w", d.mapType, r.Error)
 				}
 				return
@@ -197,7 +208,7 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(0))
 	}
 
-	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !isMaxDepth(r.Error) {
+	if r.Error != nil && !errors.Is(r.Error, io.EOF) && !takesNoContext(r.Error) {
 		r.Error = fmt.Errorf("%v: %w", d.mapType, r.Error)
 	}
 }
@@ -241,7 +252,7 @@ func (e *mapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		}
 	}
 
-	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !isMaxDepth(w.Error) {
+	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !takesNoContext(w.Error) {
 		w.Error = fmt.Errorf("%v: %w", e.mapType, w.Error)
 	}
 }
@@ -300,7 +311,7 @@ func (e *mapEncoderMarshaller) Encode(ptr unsafe.Pointer, w *Writer) {
 		}
 	}
 
-	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !isMaxDepth(w.Error) {
+	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !takesNoContext(w.Error) {
 		w.Error = fmt.Errorf("%v: %w", e.mapType, w.Error)
 	}
 }
@@ -361,7 +372,7 @@ func (e *mapEncoderAppender) Encode(ptr unsafe.Pointer, w *Writer) {
 		}
 	}
 
-	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !isMaxDepth(w.Error) {
+	if w.Error != nil && !errors.Is(w.Error, io.EOF) && !takesNoContext(w.Error) {
 		w.Error = fmt.Errorf("%v: %w", e.mapType, w.Error)
 	}
 }

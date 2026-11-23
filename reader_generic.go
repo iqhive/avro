@@ -164,8 +164,14 @@ func (r *Reader) ReadNext(schema Schema) any {
 	}
 }
 
-// ReadArrayCB reads an array with a callback per item.
+// ReadArrayCB reads an array with a callback per item. The array counts as a
+// level of nesting against Config.MaxDepth, and items the callback reads no
+// bytes for count against the input as the array decoders count elements
+// that take no bytes.
 func (r *Reader) ReadArrayCB(fn func(*Reader) bool) {
+	if !r.enter() {
+		return
+	}
 	var size int
 	for {
 		l, _ := r.ReadBlockHeader()
@@ -174,22 +180,29 @@ func (r *Reader) ReadArrayCB(fn func(*Reader) bool) {
 		}
 		if l > r.cfg.getMaxSliceAllocSize()-size {
 			r.ReportError("decode array", "size is greater than `Config.MaxSliceAllocSize`")
-			return
+			break
 		}
 		size += l
 		for range l {
+			start := r.position()
 			if !fn(r) {
+				r.leave()
 				return
 			}
-			if r.Error != nil {
+			if r.Error != nil || (r.position() == start && !r.takeNoBytes(1)) {
 				break
 			}
 		}
 	}
+	r.leave()
 }
 
-// ReadMapCB reads a map with a callback per entry.
+// ReadMapCB reads a map with a callback per entry. The map counts as a level
+// of nesting against Config.MaxDepth.
 func (r *Reader) ReadMapCB(fn func(*Reader, string) bool) {
+	if !r.enter() {
+		return
+	}
 	var size int
 	for {
 		l, _ := r.ReadBlockHeader()
@@ -198,13 +211,14 @@ func (r *Reader) ReadMapCB(fn func(*Reader, string) bool) {
 		}
 		if l > r.cfg.getMaxMapAllocSize()-size {
 			r.ReportError("decode map", "size is greater than `Config.MaxMapAllocSize`")
-			return
+			break
 		}
 		size += l
 
 		for range l {
 			field := r.ReadString()
 			if !fn(r, field) {
+				r.leave()
 				return
 			}
 			if r.Error != nil {
@@ -212,6 +226,7 @@ func (r *Reader) ReadMapCB(fn func(*Reader, string) bool) {
 			}
 		}
 	}
+	r.leave()
 }
 
 var byteType = reflect.TypeFor[byte]()

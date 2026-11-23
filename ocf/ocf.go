@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 	"os"
 
 	"github.com/iqhive/avro/v2"
-	"github.com/iqhive/avro/v2/internal/bytesx"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -116,17 +116,56 @@ func WithMaxDecompressedBlockBytes(n int) DecoderFunc {
 
 // Decoder reads and decodes Avro values from a container file.
 type Decoder struct {
-	reader      *avro.Reader
-	resetReader *bytesx.ResetReader
-	decoder     *avro.Decoder
-	meta        map[string][]byte
-	sync        [16]byte
-	schema      avro.Schema
+	reader *avro.Reader
+	// block reads the values of the current block, from its decoded bytes.
+	block  *avro.Reader
+	meta   map[string][]byte
+	sync   [16]byte
+	schema avro.Schema
 
 	codec Codec
 
 	count         int64
 	maxBlockBytes int
+	// noBytes is whether the file's records take no bytes.
+	noBytes bool
+	// inBlock is whether block holds a block not yet checked for data left
+	// after its last record.
+	inBlock bool
+}
+
+// maxNoBytesRecords is the most records that take no bytes the encoder writes
+// in a block: what a decoder allows such a block with the default Config.
+const maxNoBytesRecords = 1024
+
+// takesNoBytes reports whether every value of schema is encoded in no bytes: a
+// null, a fixed of size 0, or a record whose fields all take no bytes. seen
+// holds the answer for the records it has looked at; a record met again while
+// its fields are looked at is recursive and counts as taking bytes.
+func takesNoBytes(schema avro.Schema, seen map[*avro.RecordSchema]bool) bool {
+	switch schema.Type() {
+	case avro.Null:
+		return true
+	case avro.Fixed:
+		return schema.(*avro.FixedSchema).Size() == 0
+	case avro.Ref:
+		return takesNoBytes(schema.(*avro.RefSchema).Schema(), seen)
+	case avro.Record:
+		rec := schema.(*avro.RecordSchema)
+		if noBytes, ok := seen[rec]; ok {
+			return noBytes
+		}
+		seen[rec] = false
+		for _, f := range rec.Fields() {
+			if !takesNoBytes(f.Type(), seen) {
+				return false
+			}
+		}
+		seen[rec] = true
+		return true
+	default:
+		return false
+	}
 }
 
 // NewDecoder returns a new decoder that reads from reader r.
@@ -151,17 +190,15 @@ func NewDecoder(r io.Reader, opts ...DecoderFunc) (*Decoder, error) {
 		return nil, fmt.Errorf("decoder: %w", err)
 	}
 
-	decReader := bytesx.NewResetReader([]byte{})
-
 	return &Decoder{
 		reader:        reader,
-		resetReader:   decReader,
-		decoder:       cfg.DecoderConfig.NewDecoder(h.Schema, decReader),
+		block:         avro.NewReader(nil, 0, avro.WithReaderConfig(cfg.DecoderConfig)),
 		meta:          h.Meta,
 		sync:          h.Sync,
 		codec:         h.Codec,
 		schema:        h.Schema,
 		maxBlockBytes: cfg.MaxBlockBytes,
+		noBytes:       takesNoBytes(h.Schema, map[*avro.RecordSchema]bool{}),
 	}, nil
 }
 
@@ -197,7 +234,19 @@ func (d *Decoder) Decode(v any) error {
 
 	d.count--
 
-	return d.decoder.Decode(v)
+	d.block.ReadVal(d.schema, v)
+	err := d.block.Error
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		// The block's count says a value is due, so a block that runs out
+		// first is corrupt, not the end of the file: it ends iteration, and
+		// Error reports it.
+		err = fmt.Errorf("decoder: block holds fewer records than its count: %w", err)
+		d.reader.Error = err
+	}
+	return err
 }
 
 // Error returns the last reader error.
@@ -217,7 +266,48 @@ func (d *Decoder) Close() error {
 	return nil
 }
 
+// blockReadToEnd reports whether the block last read was read to its end, and
+// records a corrupt block if data is left after its last record. The data
+// holds exactly the block's records, and Java's reader refuses leftover bytes
+// too ("Block read partially"): a count that is too low, or garbage after the
+// records, would otherwise lose records without an error.
+func (d *Decoder) blockReadToEnd() bool {
+	if !d.inBlock {
+		return true
+	}
+	d.inBlock = false
+	if d.block.Error != nil {
+		// Decode returned the error already.
+		return true
+	}
+	if _ = d.block.Peek(); d.block.Error == nil {
+		d.reader.Error = errors.New("decoder: block holds more data than its records")
+		return false
+	}
+	return true
+}
+
+// takeNoBytesRecords counts a block's records, when they take no bytes, against
+// the block reader's budget for such elements, which Config.MaxSliceAllocSize
+// can lower. It reads the count as the header of an array of such elements, so
+// a block gets what one value of such an array gets. Unbounded, a 120-byte
+// file could claim 2^62 empty records.
+func (d *Decoder) takeNoBytesRecords(count int64) bool {
+	header := append(binary.AppendUvarint(nil, uint64(count)<<1), 0)
+	d.block.Reset(header)
+	d.block.ReadArrayCB(func(*avro.Reader) bool { return true })
+	if err := d.block.Error; err != nil {
+		d.reader.Error = fmt.Errorf("decoder: a block claims %d records that take no bytes: %w", count, err)
+		return false
+	}
+	return true
+}
+
 func (d *Decoder) readBlock() int64 {
+	if !d.blockReadToEnd() {
+		return 0
+	}
+
 	_ = d.reader.Peek()
 	if errors.Is(d.reader.Error, io.EOF) {
 		// There is no next block
@@ -242,6 +332,9 @@ func (d *Decoder) readBlock() int64 {
 		d.reader.ReportError("ocf decoder: read block", "block size is greater than `WithMaxBlockBytes`")
 		return 0
 	}
+	if d.noBytes && !d.takeNoBytesRecords(count) {
+		return 0
+	}
 	size := int(size64)
 
 	data, err := readBounded(d.reader, size)
@@ -257,13 +350,16 @@ func (d *Decoder) readBlock() int64 {
 		return 0
 	}
 
+	// A block of no records is skipped without decompressing it, so a
+	// compression bomb in one costs nothing; its data is not checked.
 	if count > 0 {
 		decoded, err := d.codec.Decode(data)
 		if err != nil {
 			d.reader.Error = err
 			return 0
 		}
-		d.resetReader.Reset(decoded)
+		d.block.Reset(decoded)
+		d.inBlock = true
 	}
 
 	return count
@@ -419,6 +515,9 @@ type Encoder struct {
 	blockLength int
 	count       int
 	blockSize   int
+	// noBytes is whether the records take no bytes: a block then holds at
+	// most maxNoBytesRecords of them.
+	noBytes bool
 
 	// Stored for Reset.
 	header Header
@@ -475,6 +574,7 @@ func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (*Encoder, e
 				codec:       h.Codec,
 				blockLength: cfg.BlockLength,
 				blockSize:   cfg.BlockSize,
+				noBytes:     takesNoBytes(h.Schema, map[*avro.RecordSchema]bool{}),
 				header: Header{
 					Magic: magicBytes,
 					Meta:  h.Meta,
@@ -521,6 +621,7 @@ func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (*Encoder, e
 		codec:       codec,
 		blockLength: cfg.BlockLength,
 		blockSize:   cfg.BlockSize,
+		noBytes:     takesNoBytes(schema, map[*avro.RecordSchema]bool{}),
 		header:      header,
 	}
 	return e, nil
@@ -547,7 +648,8 @@ func computeEncoderConfig(opts []EncoderFunc) encoderConfig {
 func (e *Encoder) shouldWriteDataBlock() bool {
 	blockLengthReached := e.blockLength != 0 && e.count >= e.blockLength
 	blockSizeReached := e.blockSize != 0 && e.buf.Len() >= e.blockSize
-	return blockLengthReached || blockSizeReached
+	noBytesReached := e.noBytes && e.count >= maxNoBytesRecords
+	return blockLengthReached || blockSizeReached || noBytesReached
 }
 
 // Write v to the internal buffer. This method skips the internal encoder and

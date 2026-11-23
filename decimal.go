@@ -5,12 +5,14 @@ import (
 )
 
 // maxDecimalPrecision is the largest precision, and so scale, a decimal
-// logical type may have. Decoding a decimal value computes 10^scale, so a
-// schema from an untrusted OCF header or schema registry claiming a scale
-// of a billion spent unbounded time and memory on every value. Real
-// systems stop far below this: MySQL's largest decimal has precision 65,
-// and Spark, Hive and Oracle stop at 38.
-const maxDecimalPrecision = 100_000
+// logical type may have. Decoding a decimal value computes 10^scale, and the
+// *big.Rat it returns keeps that power as its denominator, so a schema from
+// an untrusted OCF header or schema registry decides what each value costs:
+// at scale 100000 a two-byte value took a millisecond and 80 KB of heap. At
+// 1000 it costs a few microseconds and about 1 KB. PostgreSQL's numeric
+// allows a declared precision of up to 1000, the most of any common system:
+// MySQL stops at 65, and Spark, Hive and Oracle at 38.
+const maxDecimalPrecision = 1000
 
 // checkDecimalPrecision checks if the value exceeds the specified precision.
 // returns the number of digits and whether it is valid.

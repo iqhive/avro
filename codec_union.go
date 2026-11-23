@@ -368,11 +368,7 @@ type unionConverterToAnyCodec struct {
 
 func (e *unionConverterToAnyCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	if *(*unsafe.Pointer)(ptr) == nil {
-		if !e.nullable {
-			w.Error = errors.New("avro: unionConverterToAnyCodec: encoding nil value for non nillable union")
-			return
-		}
-		w.WriteInt(e.nullIdx)
+		e.encodeNull(w)
 		return
 	}
 
@@ -384,11 +380,7 @@ func (e *unionConverterToAnyCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 		return
 	}
 	if val == nil {
-		if !e.nullable {
-			w.Error = errors.New("avro: unionConverterToAnyCodec: encoding nil value for non nillable union")
-			return
-		}
-		w.WriteInt(e.nullIdx)
+		e.encodeNull(w)
 		return
 	}
 
@@ -398,9 +390,23 @@ func (e *unionConverterToAnyCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 		w.Error = fmt.Errorf("avro: expected ptr but received %q", typeOf.String())
 		return
 	}
+	if reflect2.PtrOf(val) == nil {
+		// A nil pointer of a concrete type holds no value either.
+		e.encodeNull(w)
+		return
+	}
 
 	elemType := typeOfUnsafePtr.Elem()
 	w.WriteVal(e.schema, elemType.Indirect(val))
+}
+
+// encodeNull writes the union's null branch, or reports that it has none.
+func (e *unionConverterToAnyCodec) encodeNull(w *Writer) {
+	if !e.nullable {
+		w.Error = errors.New("avro: unionConverterToAnyCodec: encoding nil value for non nillable union")
+		return
+	}
+	w.WriteInt(e.nullIdx)
 }
 
 func encoderOfNullableUnion(e *encoderContext, schema Schema, typ reflect2.Type) ValEncoder {
@@ -696,6 +702,11 @@ func getUnionSchema(schema *UnionSchema, r *Reader) (int, Schema) {
 	types := schema.Types()
 
 	idx := int(r.ReadInt())
+	if r.Error != nil {
+		// After an error ReadInt returns 0. Branch 0 can be the record being
+		// decoded, and decoding it would walk the schema to MaxDepth.
+		return 0, nil
+	}
 	if idx < 0 || idx > len(types)-1 {
 		r.ReportError("decode union type", "unknown union type")
 		return 0, nil

@@ -3,6 +3,7 @@ package avro
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"reflect"
 	"time"
@@ -18,15 +19,84 @@ var (
 	durType          = reflect.TypeFor[LogicalDuration]()
 )
 
-// errMaxDepth is the error for records nested deeper than Config.MaxDepth.
-// Decoders and encoders return it as it is, without the context they add to
-// other errors on the way out: adding to it at each of thousands of levels
-// would take memory in proportion to the square of the depth.
-var errMaxDepth = errors.New("avro: records are nested deeper than Config.MaxDepth")
+// errMaxDepth is the error for records, arrays and maps nested deeper than
+// Config.MaxDepth. Decoders and encoders return it as it is, without the
+// context they add to other errors on the way out.
+var errMaxDepth = errors.New("avro: records, arrays and maps are nested deeper than Config.MaxDepth")
 
-// isMaxDepth reports whether err is errMaxDepth, which gets no context.
-func isMaxDepth(err error) bool {
-	return errors.Is(err, errMaxDepth)
+// maxErrorContext is how many levels of context (a field name, a Go type) an
+// error collects on its way out of nested values. Each level builds a message
+// that holds every level below it, so for an error deep in data nested
+// thousands of levels, unbounded context took time and memory in proportion
+// to the square of the depth. The levels nearest the error are the ones kept,
+// and a "..." level marks where the rest were cut.
+const maxErrorContext = 32
+
+// contextError is an error with the levels of context it collected on its way
+// out of nested values.
+type contextError struct {
+	msg    string
+	levels int
+	err    error
+}
+
+func (e *contextError) Error() string {
+	return e.msg
+}
+
+func (e *contextError) Unwrap() error {
+	return e.err
+}
+
+// contextLevels returns how many levels of context err holds. Only levels
+// count, not the cause's own wraps ("reading long: ").
+func contextLevels(err error) int {
+	if ce, ok := err.(*contextError); ok {
+		return ce.levels
+	}
+	return 0
+}
+
+// withContext returns err with one more level of context. Past
+// maxErrorContext levels it adds "..." once, so a reader knows the outer
+// levels were cut, and then nothing more. errMaxDepth gets no context.
+func withContext(err error, context string) error {
+	if errors.Is(err, errMaxDepth) {
+		return err
+	}
+	levels := contextLevels(err)
+	switch {
+	case levels < maxErrorContext:
+	case levels == maxErrorContext:
+		context = "..."
+	default:
+		return err
+	}
+	return &contextError{msg: context + ": " + err.Error(), levels: levels + 1, err: err}
+}
+
+// takesNoContext reports whether err takes no more context on its way out:
+// errMaxDepth takes none, and an error that holds maxErrorContext levels
+// takes only the "..." that levelDecoder and levelEncoder add.
+func takesNoContext(err error) bool {
+	return errors.Is(err, errMaxDepth) || contextLevels(err) >= maxErrorContext
+}
+
+// asLevel makes the context a map codec added to err (which it does with
+// fmt.Errorf) one level, and adds the "..." when err holds maxErrorContext
+// levels already.
+func asLevel(err error) error {
+	if err == nil || errors.Is(err, errMaxDepth) || errors.Is(err, io.EOF) {
+		return err
+	}
+	if levels := contextLevels(err); levels >= maxErrorContext {
+		return withContext(err, "")
+	}
+	if _, ok := err.(*contextError); ok {
+		return err
+	}
+	inner := errors.Unwrap(err)
+	return &contextError{msg: err.Error(), levels: contextLevels(inner) + 1, err: err}
 }
 
 type null struct{}
@@ -112,6 +182,7 @@ func (d *deferEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 type decoderContext struct {
 	cfg      *frozenConfig
 	decoders map[cacheKey]ValDecoder
+	noBytes  noBytesMemo
 }
 
 func newDecoderContext(cfg *frozenConfig) *decoderContext {
@@ -124,6 +195,7 @@ func newDecoderContext(cfg *frozenConfig) *decoderContext {
 type encoderContext struct {
 	cfg      *frozenConfig
 	encoders map[cacheKey]ValEncoder
+	noBytes  noBytesMemo
 }
 
 func newEncoderContext(cfg *frozenConfig) *encoderContext {
@@ -168,7 +240,7 @@ func decoderOfType(d *decoderContext, schema Schema, typ reflect2.Type) ValDecod
 	case Array:
 		return createDecoderOfArray(d, schema.(*ArraySchema), typ)
 	case Map:
-		return createDecoderOfMap(d, schema.(*MapSchema), typ)
+		return &levelDecoder{decoder: createDecoderOfMap(d, schema.(*MapSchema), typ)}
 	case Union:
 		return createDecoderOfUnion(d, schema.(*UnionSchema), typ)
 	case Fixed:
@@ -238,7 +310,7 @@ func encoderOfType(e *encoderContext, schema Schema, typ reflect2.Type) ValEncod
 	case Array:
 		return createEncoderOfArray(e, schema.(*ArraySchema), typ)
 	case Map:
-		return createEncoderOfMap(e, schema.(*MapSchema), typ)
+		return &levelEncoder{encoder: createEncoderOfMap(e, schema.(*MapSchema), typ)}
 	case Union:
 		return createEncoderOfUnion(e, schema.(*UnionSchema), typ)
 	case Fixed:
@@ -247,6 +319,42 @@ func encoderOfType(e *encoderContext, schema Schema, typ reflect2.Type) ValEncod
 		// It is impossible to get here with a valid schema
 		return &errorEncoder{err: fmt.Errorf("avro: schema type %s is unsupported", schema.Type())}
 	}
+}
+
+// levelDecoder counts the value its decoder reads as one level of nesting
+// against Config.MaxDepth: a map's values may be maps or arrays, each another
+// step of Go recursion. Records and arrays count themselves. It also counts
+// the context the map decoder adds to an error as one level (asLevel).
+type levelDecoder struct {
+	decoder ValDecoder
+}
+
+func (d *levelDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
+	if !r.enter() {
+		return
+	}
+	d.decoder.Decode(ptr, r)
+	if r.Error != nil {
+		r.Error = asLevel(r.Error)
+	}
+	r.leave()
+}
+
+// levelEncoder counts the value its encoder writes as one level of nesting,
+// as levelDecoder does.
+type levelEncoder struct {
+	encoder ValEncoder
+}
+
+func (e *levelEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
+	if !w.enter() {
+		return
+	}
+	e.encoder.Encode(ptr, w)
+	if w.Error != nil {
+		w.Error = asLevel(w.Error)
+	}
+	w.leave()
 }
 
 type errorDecoder struct {
