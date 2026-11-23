@@ -406,7 +406,9 @@ func TestDecoder_DeflateCapAtMaxIntDoesNotOverflow(t *testing.T) {
 }
 
 func TestDecoder_DeflateDecompressedSizeBoundary(t *testing.T) {
-	original := buildOCF(t, ocf.Deflate, []int64{1, 2, 3})
+	// 1024 records of 0, one byte each, so the block's 1024 bytes hold
+	// exactly its records: bytes left after them are a corrupt block.
+	original := buildOCF(t, ocf.Deflate, make([]int64, 1024))
 	body := craftDeflate(t, bytes.Repeat([]byte{0}, 1024))
 	mutated := replaceFirstBlockPayload(t, original, body)
 
@@ -422,7 +424,7 @@ func TestDecoder_DeflateDecompressedSizeBoundary(t *testing.T) {
 			n++
 		}
 		require.NoError(t, dec.Error())
-		assert.Equal(t, 3, n)
+		assert.Equal(t, 1024, n)
 	})
 
 	t.Run("one byte over cap rejected", func(t *testing.T) {
@@ -570,4 +572,30 @@ type bufferAt []byte
 func (b *bufferAt) Write(p []byte) (int, error) {
 	*b = append(*b, p...)
 	return len(p), nil
+}
+
+// Checking the deflate compression level by building a flate writer made
+// every NewDecoder of a deflate file, which never compresses, allocate most of
+// a megabyte: opening a small file took four times as long.
+func TestDecoder_DeflateOpenBuildsNoCompressor(t *testing.T) {
+	file := buildOCF(t, ocf.Deflate, []int64{1, 2, 3})
+	cache := &avro.SchemaCache{}
+	open := func() {
+		dec, err := ocf.NewDecoder(bytes.NewReader(file), ocf.WithDecoderSchemaCache(cache))
+		require.NoError(t, err)
+		require.NoError(t, dec.Close())
+	}
+	open()
+
+	const opens = 20
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range opens {
+		open()
+	}
+	runtime.ReadMemStats(&after)
+
+	perOpen := (after.TotalAlloc - before.TotalAlloc) / opens
+	assert.Less(t, perOpen, uint64(256<<10), "NewDecoder allocated %d bytes for a deflate file", perOpen)
 }

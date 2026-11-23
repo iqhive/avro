@@ -244,6 +244,30 @@ func BenchmarkMapDecode(b *testing.B) {
 	}
 }
 
+// BenchmarkMapDecodeReused decodes into one target over and over, so every
+// key is one its maps already hold.
+func BenchmarkMapDecodeReused(b *testing.B) {
+	schema, err := avro.ParseFiles("testdata/mapbench.avsc")
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for _, n := range []int{10, 50, 200} {
+		data, err := avro.Marshal(schema, makeMapBench(n))
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			var m MapBench
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = avro.Unmarshal(schema, data, &m)
+			}
+		})
+	}
+}
+
 func BenchmarkMapGenericDecode(b *testing.B) {
 	schema, err := avro.ParseFiles("testdata/mapbench.avsc")
 	if err != nil {

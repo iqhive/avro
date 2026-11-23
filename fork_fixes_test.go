@@ -580,6 +580,90 @@ func TestFix_UnionIntoReusedMap(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+// A reused map decoded the value of a key it already held into the value held
+// there, where hamba/avro decoded every value into a new one: a nested map
+// took the new entries beside the old ones, a field the schema does not name
+// kept its value, a slice or a pointer the caller kept was written over, an
+// any holding the *big.Rat of a fixed decimal was refused and one of a bytes
+// decimal was overwritten, and an any holding its own address sent the
+// decoder round until the stack overflowed.
+func TestFix_ReusedMapDecodesEachValueAfresh(t *testing.T) {
+	type item struct {
+		A    int `avro:"a"`
+		Note string
+	}
+	items := avro.MustParse(`{"type":"map","values":{"type":"record","name":"Item","fields":[{"name":"a","type":"int"}]}}`)
+	itemBody := []byte{0x02, 0x02, 'k', 0x04, 0x00} // {"k": {"a": 2}}
+
+	t.Run("nested map", func(t *testing.T) {
+		schema := avro.MustParse(`{"type":"map","values":{"type":"map","values":"string"}}`)
+		first, err := avro.Marshal(schema, map[string]map[string]string{"a": {"x": "1"}})
+		require.NoError(t, err)
+		second, err := avro.Marshal(schema, map[string]map[string]string{"a": {"y": "2"}})
+		require.NoError(t, err)
+		var got map[string]map[string]string
+		require.NoError(t, avro.Unmarshal(schema, first, &got))
+		require.NoError(t, avro.Unmarshal(schema, second, &got))
+		assert.Equal(t, map[string]map[string]string{"a": {"y": "2"}}, got)
+	})
+	t.Run("record with a field the schema does not name", func(t *testing.T) {
+		got := map[string]item{"k": {A: 1, Note: "old"}}
+		require.NoError(t, avro.Unmarshal(items, itemBody, &got))
+		assert.Equal(t, map[string]item{"k": {A: 2}}, got)
+	})
+	t.Run("pointer", func(t *testing.T) {
+		kept := &item{A: 1, Note: "old"}
+		got := map[string]*item{"k": kept}
+		require.NoError(t, avro.Unmarshal(items, itemBody, &got))
+		assert.Equal(t, &item{A: 2}, got["k"])
+		assert.Equal(t, &item{A: 1, Note: "old"}, kept, "the item the map held was written")
+	})
+	t.Run("slice", func(t *testing.T) {
+		schema := avro.MustParse(`{"type":"map","values":{"type":"array","items":"long"}}`)
+		kept := []int64{1, 2}
+		got := map[string][]int64{"k": kept}
+		require.NoError(t, avro.Unmarshal(schema, []byte{0x02, 0x02, 'k', 0x02, 0x12, 0x00, 0x00}, &got)) // {"k": [9]}
+		assert.Equal(t, map[string][]int64{"k": {9}}, got)
+		assert.Equal(t, []int64{1, 2}, kept, "the slice the map held was written")
+	})
+	for _, dec := range []string{
+		`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+		`{"type":"fixed","name":"D","size":8,"logicalType":"decimal","precision":10,"scale":2}`,
+	} {
+		t.Run("any holding a decimal "+string(avro.MustParse(dec).Type()), func(t *testing.T) {
+			schema := avro.MustParse(`{"type":"map","values":` + dec + `}`)
+			first, err := avro.Marshal(schema, map[string]*big.Rat{"a": big.NewRat(12345, 100)})
+			require.NoError(t, err)
+			second, err := avro.Marshal(schema, map[string]*big.Rat{"a": big.NewRat(-67890, 100)})
+			require.NoError(t, err)
+			var got map[string]any
+			require.NoError(t, avro.Unmarshal(schema, first, &got))
+			held, ok := got["a"].(*big.Rat)
+			require.True(t, ok, "got %T", got["a"])
+			require.NoError(t, avro.Unmarshal(schema, second, &got))
+			r, ok := got["a"].(*big.Rat)
+			require.True(t, ok, "got %T", got["a"])
+			assert.Equal(t, "-678.90", r.FloatString(2))
+			assert.Equal(t, "123.45", held.FloatString(2), "the *big.Rat the map held was written")
+		})
+	}
+	t.Run("any holding its own address", func(t *testing.T) {
+		inChild(t, func() {
+			debug.SetMaxStack(16 << 20)
+			schema := avro.MustParse(`{"type":"map","values":"long"}`)
+			var x any
+			x = &x
+			got := map[string]any{"k": &x}
+			if err := avro.Unmarshal(schema, []byte{0x02, 0x02, 'k', 0x0e, 0x00}, &got); err != nil { // {"k": 7}
+				childFail(fmt.Sprintf("Unmarshal: %v", err))
+			}
+			if got["k"] != int64(7) {
+				childFail(fmt.Sprintf("got[k] = %#v, want int64(7)", got["k"]))
+			}
+		})
+	})
+}
+
 // Skipping a field of type null (one the Go type does not have) failed with
 // "schema type null is unsupported".
 func TestFix_SkipNullField(t *testing.T) {
@@ -921,14 +1005,14 @@ func TestFix_BytesDecimalPrecisionIsCapped(t *testing.T) {
 	assert.Equal(t, []byte{0xff}, got)
 
 	// The same holds for a fixed.decimal whose precision the cap, not the
-	// physical size, rejects: a 41600-byte fixed can hold 100000 digits, but
+	// physical size, rejects: a 418-byte fixed can hold 1006 digits, but
 	// the cap stops at the same place it does for bytes.
-	fixed := avro.MustParse(`{"type":"fixed","name":"F","size":41600,
-		"logicalType":"decimal","precision":100001,"scale":100001}`)
+	fixed := avro.MustParse(`{"type":"fixed","name":"F","size":418,
+		"logicalType":"decimal","precision":1001,"scale":1001}`)
 	assert.Nil(t, fixed.(*avro.FixedSchema).Logical())
 
 	// A decimal at the cap is still a decimal.
-	atCap := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":100000,"scale":100000}`)
+	atCap := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":1000,"scale":1000}`)
 	assert.Equal(t, avro.Decimal, atCap.(*avro.PrimitiveSchema).Logical().Type())
 	var rat any
 	require.NoError(t, avro.Unmarshal(atCap, []byte{0x00}, &rat))
@@ -1177,4 +1261,191 @@ func TestFix_ResetClearsReaderAndWriterErrors(t *testing.T) {
 	require.NoError(t, w.Error)
 	w.WriteInt(1)
 	require.NoError(t, w.Error)
+}
+
+// Refusing an alias that names a schema already in the cache broke the two
+// commonest uses of a shared cache: parsing one schema with an alias twice
+// (avro.Parse uses DefaultSchemaCache), and parsing a writer schema and then
+// a reader that renames the writer's record and keeps its old name as an
+// alias. An alias may still not repeat a name in its own schema, but one that
+// names a type an earlier parse defined leaves that type where it is.
+func TestFix_AliasesSurviveReparseAndRename(t *testing.T) {
+	for _, s := range []string{
+		`{"type":"record","name":"a.New","aliases":["a.Old"],"fields":[{"name":"x","type":"int"}]}`,
+		`{"type":"enum","name":"a.E","aliases":["a.OldE"],"symbols":["A"]}`,
+		`{"type":"fixed","name":"a.F","aliases":["a.OldF"],"size":2}`,
+		`{"type":"record","name":"a.Twice","aliases":["a.Same","a.Same"],"fields":[]}`,
+	} {
+		cache := &avro.SchemaCache{}
+		_, err := avro.ParseWithCache(s, "", cache)
+		require.NoError(t, err, "first parse of %s", s)
+		_, err = avro.ParseWithCache(s, "", cache)
+		require.NoError(t, err, "second parse of %s", s)
+	}
+
+	cache := &avro.SchemaCache{}
+	writer, err := avro.ParseWithCache(
+		`{"type":"record","name":"b.Old","fields":[{"name":"x","type":"int"}]}`, "", cache,
+	)
+	require.NoError(t, err)
+	reader, err := avro.ParseWithCache(
+		`{"type":"record","name":"b.New","aliases":["b.Old"],"fields":[{"name":"x","type":"long"}]}`, "", cache,
+	)
+	require.NoError(t, err, "a reader whose alias is the writer's name")
+
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+	require.NoError(t, err)
+	data, err := avro.Marshal(writer, map[string]any{"x": int32(7)})
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, avro.Unmarshal(resolved, data, &got))
+	assert.Equal(t, map[string]any{"x": int64(7)}, got)
+
+	// The name still refers to the type that has it.
+	assert.Equal(t, writer.Fingerprint(), cache.Get("b.Old").Fingerprint())
+	user, err := avro.ParseWithCache(
+		`{"type":"record","name":"b.User","fields":[{"name":"o","type":"b.Old"}]}`, "", cache,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, writer.Fingerprint(), user.(*avro.RecordSchema).Fields()[0].Type().Fingerprint())
+
+	// Listed twice, an alias that names the writer's record is still left out.
+	_, err = avro.ParseWithCache(
+		`{"type":"record","name":"b.Newer","aliases":["b.Old","b.Old"],"fields":[{"name":"x","type":"long"}]}`, "", cache,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, writer.Fingerprint(), cache.Get("b.Old").Fingerprint())
+}
+
+// A bytes decimal's precision comes from the schema alone, and every value
+// decoded holds 10^scale as its denominator. With precision capped at
+// 100000, a schema from an untrusted OCF header or registry made each
+// two-byte value cost about 80 KB of heap and a millisecond to decode: a
+// 1 MiB body asked for tens of gigabytes.
+func TestFix_BytesDecimalScaleCannotAmplifyMemory(t *testing.T) {
+	const n = 200
+	schema := avro.MustParse(`{"type":"array","items":
+		{"type":"bytes","logicalType":"decimal","precision":100000,"scale":100000}}`)
+	body := binary.AppendVarint(nil, n)
+	for range n {
+		body = append(body, 0x02, 0x01) // one byte, the unscaled value 1
+	}
+	body = append(body, 0x00)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var got []any
+	err := avro.Unmarshal(schema, body, &got)
+	runtime.ReadMemStats(&after)
+
+	require.NoError(t, err)
+	require.Len(t, got, n)
+	perValue := (after.TotalAlloc - before.TotalAlloc) / n
+	assert.Less(t, perValue, uint64(4096), "allocated %d bytes per two-byte value", perValue)
+}
+
+// After a read error ReadInt returns 0, and union decoders took branch 0. When
+// that branch is the record being decoded, an empty body walked the schema to
+// MaxDepth and wrapped the error once per level: a two-way recursive record
+// took more than a second and 2 GB of allocation to report that the body was
+// empty, and a struct target 400 ms.
+func TestFix_UnionAfterReadErrorDecodesNoBranch(t *testing.T) {
+	schema := avro.MustParse(`{"type":"record","name":"Tree","fields":[
+		{"name":"l","type":["Tree","null"]},{"name":"r","type":["Tree","null"]}]}`)
+	type tree struct {
+		L *tree `avro:"l"`
+		R *tree `avro:"r"`
+	}
+
+	for name, target := range map[string]any{
+		"map":    &map[string]any{},
+		"any":    new(any),
+		"struct": &tree{},
+	} {
+		err := avro.Unmarshal(schema, nil, target)
+		require.Error(t, err, name)
+		assert.Less(t, len(err.Error()), 1024, "%s: a %d-byte error for an empty body", name, len(err.Error()))
+	}
+}
+
+// A float default of math.MaxFloat32 written the way Java's Float.toString
+// and Go's strconv write it, 3.4028235e38, is a little above
+// math.MaxFloat32 as a float64, and was refused once defaults were range
+// checked. A float rounds it to math.MaxFloat32, as it does for anything
+// within half a unit of it.
+func TestFix_FloatDefaultAtFloat32Max(t *testing.T) {
+	for def, want := range map[string]float32{
+		"3.4028235e38":   math.MaxFloat32,
+		"-3.4028235E+38": -math.MaxFloat32,
+		"1e-50":          0,
+	} {
+		s, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[
+			{"name":"f","type":"float","default":`+def+`}]}`, "", &avro.SchemaCache{})
+		require.NoError(t, err, "float default %s", def)
+		assert.Equal(t, want, s.(*avro.RecordSchema).Fields()[0].Default(), "float default %s", def)
+	}
+
+	_, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":"float","default":3.4028236e38}]}`, "", &avro.SchemaCache{})
+	require.Error(t, err, "a float default that rounds to infinity")
+
+	field, err := avro.NewField("f", avro.NewPrimitiveSchema(avro.Float, nil), avro.WithDefault(3.4028235e38))
+	require.NoError(t, err, "a float64 default within half a unit of math.MaxFloat32")
+	assert.Equal(t, float32(math.MaxFloat32), field.Default())
+	_, err = avro.NewField("f", avro.NewPrimitiveSchema(avro.Float, nil), avro.WithDefault(3.5e38))
+	require.Error(t, err)
+
+	// A schema built in Go with that default marshals to JSON that parses back.
+	rec, err := avro.NewRecordSchema("R", "", []*avro.Field{field})
+	require.NoError(t, err)
+	full, err := json.Marshal(rec)
+	require.NoError(t, err)
+	_, err = avro.ParseWithCache(string(full), "", &avro.SchemaCache{})
+	require.NoError(t, err, "%s", full)
+}
+
+// ParseProtocol decoded the protocol's JSON with every number a float64, so a
+// long default above 2^53 in a protocol's types or messages still lost its
+// low digits, and Long.MAX_VALUE, which rounds to 2^63, was refused.
+func TestFix_ProtocolLongDefaultsAreExact(t *testing.T) {
+	p, err := avro.ParseProtocol(`{"protocol":"P","namespace":"p","types":[
+		{"type":"record","name":"R","fields":[
+			{"name":"a","type":"long","default":9007199254740993},
+			{"name":"b","type":"long","default":9223372036854775807}]}],
+		"messages":{"m":{"request":[{"name":"c","type":"long","default":9007199254740995}],"response":"null"}},
+		"x":1}`)
+	require.NoError(t, err)
+
+	rec := p.Types()[0].(*avro.RecordSchema)
+	assert.Equal(t, int64(9007199254740993), rec.Fields()[0].Default())
+	assert.Equal(t, int64(math.MaxInt64), rec.Fields()[1].Default())
+	assert.Equal(t, int64(9007199254740995), p.Message("m").Request().Fields()[0].Default())
+	assert.Equal(t, float64(1), p.Prop("x"), "custom properties keep float64 numbers")
+
+	_, err = avro.ParseProtocol(`{"protocol":"P","messages":{}} {}`)
+	require.Error(t, err, "trailing content after the protocol")
+}
+
+type typedNilUnionConverter struct{}
+
+func (*typedNilUnionConverter) FromAny(any) error { return nil }
+
+func (*typedNilUnionConverter) ToAny() (any, error) { return (*int64)(nil), nil }
+
+// A UnionConverter whose ToAny returned a nil pointer of a concrete type, not
+// a nil interface, made Marshal dereference it and panic.
+func TestFix_UnionConverterToAnyTypedNil(t *testing.T) {
+	var got []byte
+	var err error
+	require.NotPanics(t, func() {
+		got, err = avro.Marshal(avro.MustParse(`["long","null"]`), &typedNilUnionConverter{})
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0x02}, got)
+
+	require.NotPanics(t, func() {
+		_, err = avro.Marshal(avro.MustParse(`["long","string"]`), &typedNilUnionConverter{})
+	})
+	require.Error(t, err)
 }
