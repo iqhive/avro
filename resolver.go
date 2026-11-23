@@ -3,6 +3,7 @@ package avro
 import (
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -11,8 +12,9 @@ import (
 
 // TypeResolver resolves types by name.
 type TypeResolver struct {
-	names sync.Map // map[string]reflect2.Type
-	types sync.Map // map[int][]string
+	names   sync.Map // map[string]reflect2.Type
+	types   sync.Map // map[int][]string
+	typesMu sync.Mutex
 }
 
 // NewTypeResolver creates a new type resolver with all primitive types
@@ -57,11 +59,15 @@ func (r *TypeResolver) Register(name string, obj any) {
 
 	r.names.Store(name, typ)
 
-	raw, ok := r.types.LoadOrStore(rtype, []string{name})
+	r.typesMu.Lock()
+	defer r.typesMu.Unlock()
+
+	raw, ok := r.types.Load(rtype)
 	if !ok {
+		r.types.Store(rtype, []string{name})
 		return
 	}
-	names := raw.([]string)
+	names := slices.Clone(raw.([]string))
 	names = append(names, name)
 	r.types.Store(rtype, names)
 }
@@ -75,7 +81,7 @@ func (r *TypeResolver) Name(typ reflect2.Type) ([]string, error) {
 		return nil, fmt.Errorf("avro: unable to resolve type %s", typ.String())
 	}
 
-	return names.([]string), nil
+	return slices.Clone(names.([]string)), nil
 }
 
 // Type gets the type for a name, or an error.

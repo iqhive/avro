@@ -1,12 +1,15 @@
 package avro
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -71,7 +74,21 @@ func ParseBytes(schema []byte) (Schema, error) {
 // ParseBytesWithCache parses a schema byte slice using the given namespace and schema cache.
 func ParseBytesWithCache(schema []byte, namespace string, cache *SchemaCache) (Schema, error) {
 	var parsed any
-	if err := json.Unmarshal(schema, &parsed); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(schema))
+	decoder.UseNumber()
+	err := decoder.Decode(&parsed)
+	if err == nil {
+		// Match json.Unmarshal's rejection of a second JSON value or other
+		// trailing content instead of accepting a valid prefix.
+		var trailing any
+		err = decoder.Decode(&trailing)
+		if err == io.EOF {
+			err = nil
+		} else if err == nil {
+			err = errors.New("avro: multiple JSON values in schema")
+		}
+	}
+	if err != nil {
 		parsed = string(schema)
 	}
 
@@ -273,6 +290,15 @@ func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, c
 	ref := NewRefSchema(rec)
 	cache.Add(rec.FullName(), ref)
 	for _, alias := range rec.Aliases() {
+		if alias == rec.FullName() {
+			continue
+		}
+		if cache.Get(alias) != nil {
+			return nil, fmt.Errorf("avro: alias %q conflicts with an existing schema name", alias)
+		}
+		if err := seen.Add(alias); err != nil {
+			return nil, err
+		}
 		cache.Add(alias, ref)
 	}
 
@@ -380,6 +406,15 @@ func parseEnum(namespace string, m map[string]any, seen seenCache, cache *Schema
 	ref := NewRefSchema(enum)
 	cache.Add(enum.FullName(), ref)
 	for _, alias := range enum.Aliases() {
+		if alias == enum.FullName() {
+			continue
+		}
+		if cache.Get(alias) != nil {
+			return nil, fmt.Errorf("avro: alias %q conflicts with an existing schema name", alias)
+		}
+		if err := seen.Add(alias); err != nil {
+			return nil, err
+		}
 		cache.Add(alias, enum)
 	}
 
@@ -460,7 +495,43 @@ type fixedSchema struct {
 	Props     map[string]any `mapstructure:",remain"`
 }
 
+func parseFixedSize(raw any) (int, error) {
+	var size float64
+	switch value := raw.(type) {
+	case json.Number:
+		var err error
+		size, err = value.Float64()
+		if err != nil && !math.IsInf(size, 0) {
+			return 0, errors.New("avro: fixed size must be an integer")
+		}
+	case float64:
+		// Retain support for internal callers that built the map directly.
+		size = value
+	default:
+		return 0, errors.New("avro: fixed size must be an integer")
+	}
+	if math.IsNaN(size) || size != math.Trunc(size) {
+		return 0, errors.New("avro: fixed size must be an integer")
+	}
+	if size < 0 {
+		return 0, errors.New("avro: fixed size cannot be negative")
+	}
+	if size > maxFixedSchemaSize {
+		return 0, fmt.Errorf("avro: fixed size %v is greater than the maximum %d", size, maxFixedSchemaSize)
+	}
+	return int(size), nil
+}
+
 func parseFixed(namespace string, m map[string]any, seen seenCache, cache *SchemaCache) (Schema, error) {
+	rawSize, exists := m["size"]
+	if !exists {
+		return nil, errors.New("avro: fixed must have a size")
+	}
+	size, err := parseFixedSize(rawSize)
+	if err != nil {
+		return nil, err
+	}
+
 	var (
 		f    fixedSchema
 		meta mapstructure.Metadata
@@ -479,6 +550,7 @@ func parseFixed(namespace string, m map[string]any, seen seenCache, cache *Schem
 	if !slices.Contains(meta.Keys, "size") {
 		return nil, errors.New("avro: fixed must have a size")
 	}
+	f.Size = size
 
 	var logical LogicalSchema
 	if logicalType := logicalTypeProperty(f.Props); logicalType != "" {
@@ -500,6 +572,15 @@ func parseFixed(namespace string, m map[string]any, seen seenCache, cache *Schem
 	ref := NewRefSchema(fixed)
 	cache.Add(fixed.FullName(), ref)
 	for _, alias := range fixed.Aliases() {
+		if alias == fixed.FullName() {
+			continue
+		}
+		if cache.Get(alias) != nil {
+			return nil, fmt.Errorf("avro: alias %q conflicts with an existing schema name", alias)
+		}
+		if err := seen.Add(alias); err != nil {
+			return nil, err
+		}
 		cache.Add(alias, fixed)
 	}
 
@@ -592,6 +673,29 @@ func checkParsedName(name string) error {
 
 func decodeMap(in, v any, meta *mapstructure.Metadata) error {
 	cfg := &mapstructure.DecoderConfig{
+		DecodeHook: mapstructure.DecodeHookFuncType(func(from, to reflect.Type, data any) (any, error) {
+			if from != reflect.TypeFor[json.Number]() {
+				return data, nil
+			}
+			switch to.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				value, err := data.(json.Number).Int64()
+				if err != nil {
+					return nil, err
+				}
+				if to.Bits() < 64 {
+					min := -(1 << (to.Bits() - 1))
+					max := 1<<(to.Bits()-1) - 1
+					if value < int64(min) || value > int64(max) {
+						return nil, fmt.Errorf("avro: number %d overflows %s", value, to)
+					}
+				}
+				return reflect.ValueOf(value).Convert(to).Interface(), nil
+			default:
+				return data, nil
+			}
+		}),
+		MatchName:  func(mapKey, fieldName string) bool { return mapKey == fieldName },
 		ZeroFields: true,
 		Metadata:   meta,
 		Result:     v,

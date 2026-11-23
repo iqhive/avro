@@ -47,6 +47,7 @@ func (w *Writer) Reset(out io.Writer) {
 	w.out = out
 	w.buf = w.buf[:0]
 	w.depth = 0
+	w.Error = nil
 }
 
 // enter counts one more level of record nesting and reports whether it is

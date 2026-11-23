@@ -46,6 +46,13 @@ func resolveCodec(name CodecName, codecOpts codecOptions) (Codec, error) {
 		return &NullCodec{}, nil
 
 	case Deflate:
+		w, err := flate.NewWriter(io.Discard, codecOpts.DeflateCompressionLevel)
+		if err != nil {
+			return nil, fmt.Errorf("deflate: %w", err)
+		}
+		if err := w.Close(); err != nil {
+			return nil, fmt.Errorf("deflate: %w", err)
+		}
 		return &DeflateCodec{
 			compLvl:         codecOpts.DeflateCompressionLevel,
 			maxDecompressed: codecOpts.MaxDecompressedBytes,
@@ -55,7 +62,7 @@ func resolveCodec(name CodecName, codecOpts codecOptions) (Codec, error) {
 		return &SnappyCodec{maxDecompressed: codecOpts.MaxDecompressedBytes}, nil
 
 	case ZStandard:
-		return newZStandardCodec(codecOpts.ZStandardOptions, codecOpts.MaxDecompressedBytes), nil
+		return newZStandardCodec(codecOpts.ZStandardOptions, codecOpts.MaxDecompressedBytes)
 
 	default:
 		return nil, fmt.Errorf("unknown codec %s", name)
@@ -175,7 +182,7 @@ type ZStandardCodec struct {
 	maxDecompressed int
 }
 
-func newZStandardCodec(opts zstdOptions, maxDecompressed int) *ZStandardCodec {
+func newZStandardCodec(opts zstdOptions, maxDecompressed int) (*ZStandardCodec, error) {
 	var decoder *zstd.Decoder
 	var encoder *zstd.Encoder
 	var sharedDecoder, sharedEncoder bool
@@ -188,14 +195,25 @@ func newZStandardCodec(opts zstdOptions, maxDecompressed int) *ZStandardCodec {
 		if maxDecompressed > 0 {
 			dOpts = append([]zstd.DOption{zstd.WithDecoderMaxMemory(uint64(maxDecompressed))}, dOpts...)
 		}
-		decoder, _ = zstd.NewReader(nil, dOpts...)
+		var err error
+		decoder, err = zstd.NewReader(nil, dOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("zstd decoder: %w", err)
+		}
 	}
 
 	if opts.Encoder != nil {
 		encoder = opts.Encoder
 		sharedEncoder = true
 	} else {
-		encoder, _ = zstd.NewWriter(nil, opts.EOptions...)
+		var err error
+		encoder, err = zstd.NewWriter(nil, opts.EOptions...)
+		if err != nil {
+			if decoder != nil && !sharedDecoder {
+				decoder.Close()
+			}
+			return nil, fmt.Errorf("zstd encoder: %w", err)
+		}
 	}
 
 	return &ZStandardCodec{
@@ -204,7 +222,7 @@ func newZStandardCodec(opts zstdOptions, maxDecompressed int) *ZStandardCodec {
 		sharedDecoder:   sharedDecoder,
 		sharedEncoder:   sharedEncoder,
 		maxDecompressed: maxDecompressed,
-	}
+	}, nil
 }
 
 // Decode decodes the given bytes.

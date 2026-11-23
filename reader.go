@@ -61,6 +61,7 @@ func (r *Reader) Reset(b []byte) *Reader {
 	r.head = 0
 	r.tail = len(b)
 	r.depth = 0
+	r.Error = nil
 	return r
 }
 

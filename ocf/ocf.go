@@ -178,9 +178,8 @@ func (d *Decoder) Schema() avro.Schema {
 
 // HasNext determines if there is another value to read.
 func (d *Decoder) HasNext() bool {
-	if d.count <= 0 {
-		count := d.readBlock()
-		d.count = count
+	for d.count <= 0 && d.reader.Error == nil {
+		d.count = d.readBlock()
 	}
 
 	if d.reader.Error != nil {

@@ -196,6 +196,13 @@ func (e *mapUnionEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		w.Error = err
 		return
 	}
+	if val == nil {
+		if schema.Type() == Null {
+			return
+		}
+		w.Error = fmt.Errorf("avro: cannot encode nil value for non-null union branch %q", name)
+		return
+	}
 
 	elemType := reflect2.TypeOf(val)
 	elemPtr := reflect2.PtrOf(val)
@@ -374,6 +381,14 @@ func (e *unionConverterToAnyCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	val, err := marshaller.ToAny()
 	if err != nil {
 		w.Error = fmt.Errorf("avro: unable to convert union: %w", err)
+		return
+	}
+	if val == nil {
+		if !e.nullable {
+			w.Error = errors.New("avro: unionConverterToAnyCodec: encoding nil value for non nillable union")
+			return
+		}
+		w.WriteInt(e.nullIdx)
 		return
 	}
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 
 	"github.com/go-viper/mapstructure/v2"
 )
@@ -105,25 +106,37 @@ func (p *Protocol) Types() []NamedSchema {
 
 // String returns the canonical form of the protocol.
 func (p *Protocol) String() string {
-	types := ""
-	for _, f := range p.types {
-		types += f.String() + ","
-	}
-	if len(types) > 0 {
-		types = types[:len(types)-1]
-	}
-
-	messages := ""
-	for k, m := range p.messages {
-		messages += `"` + k + `":` + m.String() + ","
-	}
-	if len(messages) > 0 {
-		messages = messages[:len(messages)-1]
+	var b strings.Builder
+	b.WriteString(`{"protocol":"`)
+	b.WriteString(p.Name())
+	b.WriteString(`","namespace":"`)
+	b.WriteString(p.Namespace())
+	b.WriteString(`","types":[`)
+	for i, f := range p.types {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(f.String())
 	}
 
-	return `{"protocol":"` + p.Name() +
-		`","namespace":"` + p.Namespace() +
-		`","types":[` + types + `],"messages":{` + messages + `}}`
+	b.WriteString(`],"messages":{`)
+	names := make([]string, 0, len(p.messages))
+	for name := range p.messages {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for i, name := range names {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		encodedName, _ := json.Marshal(name)
+		b.Write(encodedName)
+		b.WriteByte(':')
+		b.WriteString(p.messages[name].String())
+	}
+	b.WriteString("}}")
+
+	return b.String()
 }
 
 // Message is an Avro protocol message.
@@ -182,24 +195,26 @@ func (m *Message) Doc() string {
 
 // String returns the canonical form of the message.
 func (m *Message) String() string {
-	fields := ""
-	for _, f := range m.req.fields {
-		fields += f.String() + ","
+	var b strings.Builder
+	b.WriteString(`{"request":[`)
+	for i, f := range m.req.fields {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(f.String())
 	}
-	if len(fields) > 0 {
-		fields = fields[:len(fields)-1]
-	}
-
-	str := `{"request":[` + fields + `]`
+	b.WriteByte(']')
 	if m.resp != nil {
-		str += `,"response":` + m.resp.String()
+		b.WriteString(`,"response":`)
+		b.WriteString(m.resp.String())
 	}
 	if m.errs != nil && len(m.errs.Types()) > 1 {
 		errs, _ := NewUnionSchema(m.errs.Types()[1:])
-		str += `,"errors":` + errs.String()
+		b.WriteString(`,"errors":`)
+		b.WriteString(errs.String())
 	}
-	str += "}"
-	return str
+	b.WriteByte('}')
+	return b.String()
 }
 
 // ParseProtocolFile parses an Avro protocol from a file.
@@ -321,11 +336,16 @@ func parseMessage(namespace string, m map[string]any, seen seenCache, cache *Sch
 	}
 
 	fields := make([]*Field, len(msg.Request))
+	fieldNames := make(map[string]struct{}, len(msg.Request))
 	for i, f := range msg.Request {
 		field, err := parseField(namespace, f, seen, cache)
 		if err != nil {
 			return nil, err
 		}
+		if _, exists := fieldNames[field.name]; exists {
+			return nil, fmt.Errorf("avro: duplicate field name %q", field.name)
+		}
+		fieldNames[field.name] = struct{}{}
 		fields[i] = field
 	}
 	request := &RecordSchema{
@@ -354,7 +374,12 @@ func parseMessage(namespace string, m map[string]any, seen seenCache, cache *Sch
 				return nil, err
 			}
 
-			if rec, ok := schema.(*RecordSchema); ok && !rec.IsError() {
+			errorSchema := schema
+			if ref, ok := schema.(*RefSchema); ok {
+				errorSchema = ref.Schema()
+			}
+			rec, ok := errorSchema.(*RecordSchema)
+			if !ok || !rec.IsError() {
 				return nil, errors.New("avro: errors record schema must be of type error")
 			}
 

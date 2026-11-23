@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
+	"math/big"
 	"reflect"
 	"slices"
 	"strconv"
@@ -385,9 +387,31 @@ func newProperties(props map[string]any, res []string) properties {
 		if slices.Contains(res, k) {
 			continue
 		}
-		p.props[k] = v
+		p.props[k] = normalizePropertyNumbers(v)
 	}
 	return p
+}
+
+// normalizePropertyNumbers preserves the historical float64 representation
+// of custom JSON properties while schema defaults retain json.Number for
+// exact validation.
+func normalizePropertyNumbers(value any) any {
+	switch v := value.(type) {
+	case json.Number:
+		f, err := v.Float64()
+		if err == nil {
+			return f
+		}
+	case []any:
+		for i, elem := range v {
+			v[i] = normalizePropertyNumbers(elem)
+		}
+	case map[string]any:
+		for key, elem := range v {
+			v[key] = normalizePropertyNumbers(elem)
+		}
+	}
+	return value
 }
 
 // Prop gets a property from the schema.
@@ -651,15 +675,20 @@ func (s *RecordSchema) String() string {
 		typ = "error"
 	}
 
-	fields := ""
-	for _, f := range s.fields {
-		fields += f.String() + ","
+	var buf strings.Builder
+	buf.WriteString(`{"name":"`)
+	buf.WriteString(s.FullName())
+	buf.WriteString(`","type":"`)
+	buf.WriteString(typ)
+	buf.WriteString(`","fields":[`)
+	for i, field := range s.fields {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(field.String())
 	}
-	if len(fields) > 0 {
-		fields = fields[:len(fields)-1]
-	}
-
-	return `{"name":"` + s.FullName() + `","type":"` + typ + `","fields":[` + fields + `]}`
+	buf.WriteString(`]}`)
+	return buf.String()
 }
 
 // MarshalJSON marshals the schema to json.
@@ -1104,15 +1133,20 @@ func (s *EnumSchema) HasDefault() bool {
 
 // String returns the canonical form of the schema.
 func (s *EnumSchema) String() string {
-	symbols := ""
-	for _, sym := range s.symbols {
-		symbols += `"` + sym + `",`
+	var buf strings.Builder
+	buf.WriteString(`{"name":"`)
+	buf.WriteString(s.FullName())
+	buf.WriteString(`","type":"enum","symbols":[`)
+	for i, sym := range s.symbols {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteByte('"')
+		buf.WriteString(sym)
+		buf.WriteByte('"')
 	}
-	if len(symbols) > 0 {
-		symbols = symbols[:len(symbols)-1]
-	}
-
-	return `{"name":"` + s.FullName() + `","type":"enum","symbols":[` + symbols + `]}`
+	buf.WriteString(`]}`)
+	return buf.String()
 }
 
 // MarshalJSON marshals the schema to json.
@@ -1391,15 +1425,16 @@ func (s *UnionSchema) Indices() (null, typ int) {
 
 // String returns the canonical form of the schema.
 func (s *UnionSchema) String() string {
-	types := ""
-	for _, typ := range s.types {
-		types += typ.String() + ","
+	var buf strings.Builder
+	buf.WriteByte('[')
+	for i, typ := range s.types {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(typ.String())
 	}
-	if len(types) > 0 {
-		types = types[:len(types)-1]
-	}
-
-	return `[` + types + `]`
+	buf.WriteByte(']')
+	return buf.String()
 }
 
 // MarshalJSON marshals the schema to json.
@@ -1756,6 +1791,45 @@ func validateDefault(name string, schema Schema, def any) (any, error) {
 	return def, nil
 }
 
+func defaultJSONInteger(value json.Number, allowFraction bool) (*big.Int, bool) {
+	if i, err := value.Int64(); err == nil {
+		return big.NewInt(i), true
+	}
+
+	f, err := value.Float64()
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, false
+	}
+	if !allowFraction && (f != math.Trunc(f) || f < math.MinInt32 || f > math.MaxInt32) {
+		return nil, false
+	}
+	if f > -1 && f < 1 {
+		if allowFraction {
+			return big.NewInt(0), true
+		}
+		mantissa := value.String()
+		if exponent := strings.IndexAny(mantissa, "eE"); exponent >= 0 {
+			mantissa = mantissa[:exponent]
+		}
+		// Only a zero mantissa denotes an integer in this range. A tiny
+		// nonzero fraction must not become zero by float64 underflow.
+		return big.NewInt(0), !strings.ContainsAny(mantissa, "123456789")
+	}
+	if allowFraction && (f < float64(math.MinInt64) || f > float64(math.MaxInt64)) {
+		return nil, false
+	}
+
+	rat, ok := new(big.Rat).SetString(value.String())
+	if !ok || !allowFraction && !rat.IsInt() {
+		return nil, false
+	}
+	integer := new(big.Int).Quo(rat.Num(), rat.Denom())
+	if !integer.IsInt64() {
+		return nil, false
+	}
+	return integer, true
+}
+
 func isValidDefault(schema Schema, def any) (any, bool) {
 	switch schema.Type() {
 	case Ref:
@@ -1780,6 +1854,9 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 		if d, ok := def.(string); ok {
 			if b, ok := isValidDefaultBytes(d); ok {
 				if schema.Type() == Fixed {
+					if len(b) != schema.(*FixedSchema).Size() {
+						return nil, false
+					}
 					return byteSliceToArray(b, schema.(*FixedSchema).Size()), true
 				}
 				return b, true
@@ -1799,29 +1876,66 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 		if i, ok := def.(int32); ok {
 			return int(i), true
 		}
-		if _, ok := def.(int); ok {
-			return def, true
+		if i, ok := def.(int); ok {
+			return def, i >= math.MinInt32 && i <= math.MaxInt32
+		}
+		if value, ok := def.(json.Number); ok {
+			i, valid := defaultJSONInteger(value, false)
+			if !valid || i.Int64() < math.MinInt32 || i.Int64() > math.MaxInt32 {
+				return nil, false
+			}
+			return int(i.Int64()), true
 		}
 		if f, ok := def.(float64); ok {
+			if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < math.MinInt32 || f > math.MaxInt32 {
+				return nil, false
+			}
 			return int(f), true
 		}
 	case Long:
 		if _, ok := def.(int64); ok {
 			return def, true
 		}
+		if value, ok := def.(json.Number); ok {
+			i, valid := defaultJSONInteger(value, true)
+			if !valid {
+				return nil, false
+			}
+			return i.Int64(), true
+		}
 		if f, ok := def.(float64); ok {
+			if math.IsNaN(f) || math.IsInf(f, 0) || f < float64(math.MinInt64) || f >= float64(math.MaxInt64) {
+				return nil, false
+			}
 			return int64(f), true
 		}
 	case Float:
-		if _, ok := def.(float32); ok {
-			return def, true
+		if f, ok := def.(float32); ok {
+			return def, !math.IsInf(float64(f), 0) && !math.IsNaN(float64(f))
+		}
+		if value, ok := def.(json.Number); ok {
+			f, err := value.Float64()
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < -math.MaxFloat32 || f > math.MaxFloat32 {
+				return nil, false
+			}
+			return float32(f), true
 		}
 		if f, ok := def.(float64); ok {
+			if math.IsNaN(f) || math.IsInf(f, 0) || f < -math.MaxFloat32 || f > math.MaxFloat32 {
+				return nil, false
+			}
 			return float32(f), true
 		}
 	case Double:
-		if _, ok := def.(float64); ok {
-			return def, true
+		if value, ok := def.(json.Number); ok {
+			f, err := value.Float64()
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil, false
+			}
+			return f, true
+		}
+		if f, ok := def.(float64); ok {
+			return def, !math.IsNaN(f) && !math.IsInf(f, 0)
 		}
 	case Array:
 		arr, ok := def.([]any)
@@ -1864,9 +1978,16 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 		}
 
 		for _, field := range schema.(*RecordSchema).Fields() {
+			if field == nil {
+				// A recursive record is exposed through the schema cache before
+				// all of its fields have been parsed.
+				return nil, false
+			}
 			fieldDef := field.Default()
 			if newDef, ok := m[field.Name()]; ok {
 				fieldDef = newDef
+			} else if !field.HasDefault() {
+				return nil, false
 			}
 
 			v, ok := isValidDefault(field.Type(), fieldDef)

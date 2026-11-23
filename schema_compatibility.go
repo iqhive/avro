@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sync"
 )
 
 type recursionError struct{}
@@ -19,8 +18,12 @@ type compatKey struct {
 }
 
 // SchemaCompatibility determines the compatibility of schemas.
-type SchemaCompatibility struct {
-	cache sync.Map // map[compatKey]error
+type SchemaCompatibility struct{}
+
+// compatibilityOperation holds state that must not cross top-level operations.
+type compatibilityOperation struct {
+	SchemaCompatibility
+	cache map[compatKey]error
 }
 
 // NewSchemaCompatibility creates a new schema compatibility instance.
@@ -30,35 +33,32 @@ func NewSchemaCompatibility() *SchemaCompatibility {
 
 // Compatible determines the compatibility if the reader and writer schemas.
 func (c *SchemaCompatibility) Compatible(reader, writer Schema) error {
-	return c.compatible(reader, writer)
+	op := compatibilityOperation{cache: make(map[compatKey]error)}
+	return op.compatible(reader, writer)
 }
 
-func (c *SchemaCompatibility) compatible(reader, writer Schema) error {
+func (c *compatibilityOperation) compatible(reader, writer Schema) error {
 	key := compatKey{reader: reader.Fingerprint(), writer: writer.Fingerprint()}
-	if err, ok := c.cache.Load(key); ok {
+	if err, ok := c.cache[key]; ok {
 		if _, ok := err.(recursionError); ok {
 			// Break the recursion here.
 			return nil
 		}
 
-		if err == nil {
-			return nil
-		}
-
-		return err.(error)
+		return err
 	}
 
-	c.cache.Store(key, recursionError{})
+	c.cache[key] = recursionError{}
 	err := c.match(reader, writer)
 	if err != nil {
 		// We dont want to pay the cost of fmt.Errorf every time
 		err = errors.New(err.Error())
 	}
-	c.cache.Store(key, err)
+	c.cache[key] = err
 	return err
 }
 
-func (c *SchemaCompatibility) match(reader, writer Schema) error {
+func (c *compatibilityOperation) match(reader, writer Schema) error {
 	// If the schema is a reference, get the actual schema
 	if reader.Type() == Ref {
 		reader = reader.(*RefSchema).Schema()
@@ -199,8 +199,14 @@ func (c *SchemaCompatibility) checkFixedSize(reader, writer *FixedSchema) error 
 }
 
 func (c *SchemaCompatibility) checkEnumSymbols(reader, writer *EnumSchema) error {
+	readerSymbols := reader.Symbols()
+	symbolSet := make(map[string]struct{}, len(readerSymbols))
+	for _, symbol := range readerSymbols {
+		symbolSet[symbol] = struct{}{}
+	}
+
 	for _, symbol := range writer.Symbols() {
-		if !slices.Contains(reader.Symbols(), symbol) {
+		if _, ok := symbolSet[symbol]; !ok {
 			return fmt.Errorf("reader %s is missing symbol %s", reader.FullName(), symbol)
 		}
 	}
@@ -220,7 +226,7 @@ func (c *SchemaCompatibility) identicalEnumSymbols(reader, writer *EnumSchema) b
 	return true
 }
 
-func (c *SchemaCompatibility) checkRecordFields(reader, writer *RecordSchema) error {
+func (c *compatibilityOperation) checkRecordFields(reader, writer *RecordSchema) error {
 	for _, field := range reader.Fields() {
 		f, ok := c.getField(writer.Fields(), field, func(gfo *getFieldOptions) {
 			gfo.fieldAlias = true
@@ -275,11 +281,12 @@ func (c *SchemaCompatibility) getField(a []*Field, f *Field, optFns ...func(*get
 //
 // It fails if the writer and reader schemas are not compatible.
 func (c *SchemaCompatibility) Resolve(reader, writer Schema) (Schema, error) {
-	if err := c.compatible(reader, writer); err != nil {
+	op := compatibilityOperation{cache: make(map[compatKey]error)}
+	if err := op.compatible(reader, writer); err != nil {
 		return nil, err
 	}
 
-	schema, _, err := c.resolve(reader, writer, resolution{})
+	schema, _, err := op.resolve(reader, writer, resolution{})
 	return schema, err
 }
 
@@ -297,7 +304,7 @@ type resolvedRecord struct {
 }
 
 // resolve requires the reader's schema to be already compatible with the writer's.
-func (c *SchemaCompatibility) resolve(reader, writer Schema, res resolution) (schema Schema, resolved bool, err error) {
+func (c *compatibilityOperation) resolve(reader, writer Schema, res resolution) (schema Schema, resolved bool, err error) {
 	if reader.Type() == Ref {
 		reader = reader.(*RefSchema).Schema()
 	}
@@ -332,8 +339,14 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema, res resolution) (sc
 				}
 				schemas = append(schemas, sch)
 			}
-			s, err := NewUnionSchema(schemas, withWriterFingerprint(writer.Fingerprint()))
-			return s, true, err
+			// Resolved unions follow writer positions, so different writer branches
+			// can resolve to the same reader type.
+			fp := writer.Fingerprint()
+			s := &UnionSchema{
+				cacheFingerprinter: cacheFingerprinter{writerFingerprint: &fp},
+				types:              schemas,
+			}
+			return s, true, nil
 		}
 
 		if isPromotable(writer.Type(), reader.Type()) {
@@ -392,9 +405,12 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema, res resolution) (sc
 			schemas = append(schemas, sch)
 			resolved = resolv || resolved
 		}
-		s, err := NewUnionSchema(schemas, withWriterFingerprintIfResolved(writer.Fingerprint(), resolved))
-		if err != nil {
-			return nil, false, err
+		// Do not use NewUnionSchema: duplicate reader types at distinct writer
+		// positions are required for resolution and are not public input here.
+		s := &UnionSchema{types: schemas}
+		if resolved {
+			fp := writer.Fingerprint()
+			s.writerFingerprint = &fp
 		}
 		return s, resolved, nil
 	}
@@ -422,7 +438,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema, res resolution) (sc
 	return nil, false, fmt.Errorf("failed to resolve composite schema for %s and %s", reader.Type(), writer.Type())
 }
 
-func (c *SchemaCompatibility) resolveRecord(reader, writer Schema, res resolution) (Schema, bool, error) {
+func (c *compatibilityOperation) resolveRecord(reader, writer Schema, res resolution) (Schema, bool, error) {
 	w := writer.(*RecordSchema)
 	r := reader.(*RecordSchema)
 

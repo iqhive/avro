@@ -15,6 +15,8 @@ func (r *Reader) ReadNext(schema Schema) any {
 	}
 
 	switch schema.Type() {
+	case Null:
+		return nil
 	case Boolean:
 		return r.ReadBool()
 	case Int:
@@ -34,7 +36,7 @@ func (r *Reader) ReadNext(schema Schema) any {
 		if ls != nil {
 			switch ls.Type() {
 			case TimeMicros:
-				return time.Duration(r.ReadLong()) * time.Microsecond
+				return durationFromMicros(r, r.ReadLong())
 
 			case TimestampMillis:
 				i := r.ReadLong()
@@ -164,13 +166,21 @@ func (r *Reader) ReadNext(schema Schema) any {
 
 // ReadArrayCB reads an array with a callback per item.
 func (r *Reader) ReadArrayCB(fn func(*Reader) bool) {
+	var size int
 	for {
 		l, _ := r.ReadBlockHeader()
 		if l == 0 {
 			break
 		}
+		if l > r.cfg.getMaxSliceAllocSize()-size {
+			r.ReportError("decode array", "size is greater than `Config.MaxSliceAllocSize`")
+			return
+		}
+		size += l
 		for range l {
-			fn(r)
+			if !fn(r) {
+				return
+			}
 			if r.Error != nil {
 				break
 			}
@@ -178,17 +188,25 @@ func (r *Reader) ReadArrayCB(fn func(*Reader) bool) {
 	}
 }
 
-// ReadMapCB reads an array with a callback per item.
+// ReadMapCB reads a map with a callback per entry.
 func (r *Reader) ReadMapCB(fn func(*Reader, string) bool) {
+	var size int
 	for {
 		l, _ := r.ReadBlockHeader()
 		if l == 0 {
 			break
 		}
+		if l > r.cfg.getMaxMapAllocSize()-size {
+			r.ReportError("decode map", "size is greater than `Config.MaxMapAllocSize`")
+			return
+		}
+		size += l
 
 		for range l {
 			field := r.ReadString()
-			fn(r, field)
+			if !fn(r, field) {
+				return
+			}
 			if r.Error != nil {
 				break
 			}

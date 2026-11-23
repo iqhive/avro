@@ -3,6 +3,7 @@ package avro
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"strconv"
@@ -535,6 +536,12 @@ func (c *dateCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	if sec%day < 0 {
 		days--
 	}
+	if days < math.MinInt32 || days > math.MaxInt32 {
+		if w.Error == nil {
+			w.Error = fmt.Errorf("avro: time %s out of range for date logical type", t.Format(time.RFC3339Nano))
+		}
+		return
+	}
 	w.WriteInt(int32(days))
 }
 
@@ -721,7 +728,14 @@ func (c *timeMillisCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 
 func (c *timeMillisCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	d := *(*time.Duration)(ptr)
-	w.WriteInt(int32(d.Nanoseconds() / int64(time.Millisecond)))
+	millis := d.Nanoseconds() / int64(time.Millisecond)
+	if millis < math.MinInt32 || millis > math.MaxInt32 {
+		if w.Error == nil {
+			w.Error = fmt.Errorf("avro: duration %s out of range for time-millis logical type", d)
+		}
+		return
+	}
+	w.WriteInt(int32(millis))
 }
 
 type timeMicrosCodec struct {
@@ -735,7 +749,15 @@ func (c *timeMicrosCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	} else {
 		i = r.ReadLong()
 	}
-	*(*time.Duration)(ptr) = time.Duration(i) * time.Microsecond
+	*(*time.Duration)(ptr) = durationFromMicros(r, i)
+}
+
+func durationFromMicros(r *Reader, micros int64) time.Duration {
+	if micros > math.MaxInt64/int64(time.Microsecond) || micros < math.MinInt64/int64(time.Microsecond) {
+		r.ReportError("ReadDuration", "time-micros value out of range")
+		return 0
+	}
+	return time.Duration(micros) * time.Microsecond
 }
 
 func (c *timeMicrosCodec) Encode(ptr unsafe.Pointer, w *Writer) {
