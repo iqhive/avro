@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 
@@ -68,6 +70,45 @@ func TestDecoder_RejectsSnappyInflatedHeader(t *testing.T) {
 	assert.False(t, dec.HasNext())
 	require.Error(t, dec.Error())
 	assert.Contains(t, dec.Error().Error(), "snappy: claimed decoded size")
+}
+
+// hostileZstdTwoBlockFrames returns crafted frames whose second Huffman
+// weight table declares a count of 1<<15. In klauspost/compress before
+// v1.20.2 that count overflows int16 and stale state from the first block
+// makes DecodeAll panic instead of returning an error (CVE-2026-116591).
+func hostileZstdTwoBlockFrames() [][]byte {
+	oneFrame := slices.Concat(
+		[]byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38, 0x74, 0x06, 0x00, 0x42, 0xb8, 0x32, 0x0d, 0x1a, 0x00, 0x00, 0x00, 0x90, 0xaf, 0xfa, 0xff, 0x03, 0x00, 0x80, 0xff, 0x7f},
+		bytes.Repeat([]byte{0xa5, 0x94, 0x52, 0x4a, 0x29}, 37),
+		[]byte{0xa5, 0x94, 0x12, 0x00, 0xad, 0x56, 0x03, 0xee, 0xff, 0xdf, 0xb3, 0x1a, 0x1c, 0x1a, 0x00, 0xe0, 0xff, 0x1f, 0x0f, 0xb1, 0x9c, 0x5a, 0xcf, 0x4d, 0xe4, 0x1d, 0x7b, 0xab, 0x99, 0x5e, 0x01, 0x51, 0xa4, 0x73, 0xd8, 0xb1, 0xf3, 0x39, 0x4b, 0x67, 0xf6, 0xab, 0x1a, 0xab, 0x1a, 0xab, 0x1a},
+		bytes.Repeat([]byte{0x8c, 0x31, 0xc6, 0x18, 0x63}, 1365),
+		[]byte{0x8c, 0x31},
+		bytes.Repeat([]byte{0x63, 0x8c, 0x31, 0xc6, 0x18}, 1365),
+		[]byte{0x63, 0x2c},
+		bytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),
+		[]byte{0x31, 0x46},
+		bytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),
+		[]byte{0x31, 0x06, 0x00},
+	)
+	// Split the same blocks across frames to exercise decoder-pool state too.
+	twoFrames := slices.Concat(oneFrame[:6], []byte{0x75, 0x06, 0x00}, oneFrame[9:215], oneFrame[:6], oneFrame[215:])
+	return [][]byte{oneFrame, twoFrames}
+}
+
+func TestDecoder_RejectsZstdTwoBlockFrameWithoutPanic(t *testing.T) {
+	for i, frame := range hostileZstdTwoBlockFrames() {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			original := buildOCF(t, ocf.ZStandard, []int64{1})
+			mutated := replaceFirstBlockPayload(t, original, frame)
+
+			dec, err := ocf.NewDecoder(bytes.NewReader(mutated))
+			require.NoError(t, err)
+			defer dec.Close()
+
+			assert.False(t, dec.HasNext())
+			require.Error(t, dec.Error())
+		})
+	}
 }
 
 func TestDecoder_RejectsZstdBomb(t *testing.T) {
@@ -393,6 +434,57 @@ func TestDecoder_DeflateDecompressedSizeBoundary(t *testing.T) {
 		require.Error(t, dec.Error())
 		assert.Contains(t, dec.Error().Error(), "deflate: decompressed size exceeds")
 	})
+}
+
+func TestDecoder_ZeroCountBlockDoesNotHideFollowingBlock(t *testing.T) {
+	original := buildOCF(t, ocf.Null, []int64{42})
+	headerEnd := findFirstBlockHeaderOffset(t, original)
+	sync := original[headerEnd-16 : headerEnd]
+
+	var in bytes.Buffer
+	in.Write(original[:headerEnd])
+	writeZigZagLong(&in, 0)
+	writeZigZagLong(&in, 0)
+	in.Write(sync)
+	in.Write(original[headerEnd:])
+
+	dec, err := ocf.NewDecoder(bytes.NewReader(in.Bytes()))
+	require.NoError(t, err)
+	defer dec.Close()
+
+	require.True(t, dec.HasNext())
+	var got int64
+	require.NoError(t, dec.Decode(&got))
+	assert.Equal(t, int64(42), got)
+	assert.False(t, dec.HasNext())
+	require.NoError(t, dec.Error())
+}
+
+func TestNewDecoder_InvalidZstdOptions(t *testing.T) {
+	original := buildOCF(t, ocf.ZStandard, []int64{1})
+	dec, err := ocf.NewDecoder(
+		bytes.NewReader(original),
+		ocf.WithZStandardDecoderOptions(zstd.WithDecoderConcurrency(-1)),
+	)
+	require.Error(t, err)
+	require.Nil(t, dec)
+}
+
+func TestNewEncoder_InvalidZstdOptions(t *testing.T) {
+	enc, err := ocf.NewEncoder(
+		secSchema,
+		io.Discard,
+		ocf.WithCodec(ocf.ZStandard),
+		ocf.WithZStandardEncoderOptions(zstd.WithEncoderConcurrency(-1)),
+	)
+	require.Error(t, err)
+	require.Nil(t, enc)
+}
+
+func TestNewEncoder_InvalidDeflateLevel(t *testing.T) {
+	enc, err := ocf.NewEncoder(secSchema, io.Discard, ocf.WithCompressionLevel(12345))
+	require.Error(t, err)
+	require.Nil(t, enc)
 }
 
 func TestDecoder_ZeroCountBlockSkippedWithoutDecompress(t *testing.T) {

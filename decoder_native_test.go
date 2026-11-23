@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"bytes"
+	"math"
 	"math/big"
 	"testing"
 	"time"
@@ -1024,6 +1025,30 @@ func TestDecoder_Duration_TimeMicros(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 123456789123*time.Microsecond, got)
+}
+
+func TestDecoder_Duration_TimeMicrosOverflow(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := avro.MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	for _, value := range []int64{math.MaxInt64, math.MinInt64} {
+		data, err := avro.Marshal(avro.NewPrimitiveSchema(avro.Long, nil), value)
+		require.NoError(t, err)
+
+		t.Run("typed", func(t *testing.T) {
+			var got time.Duration
+			err := avro.Unmarshal(schema, data, &got)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "out of range")
+		})
+
+		t.Run("generic", func(t *testing.T) {
+			r := avro.NewReader(nil, 0).Reset(data)
+			_ = r.ReadNext(schema)
+			require.Error(t, r.Error)
+			assert.Contains(t, r.Error.Error(), "out of range")
+		})
+	}
 }
 
 func TestDecoder_Duration_InvalidLogicalType(t *testing.T) {

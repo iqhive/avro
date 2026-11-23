@@ -883,14 +883,20 @@ func TestFix_FixedSizeIsCapped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, max, fixed.Size())
 
-	for _, schema := range []string{
-		`{"type":"fixed","name":"F","size":68719476736}`,
-		`{"type":"record","name":"R","fields":[{"name":"f",
-			"type":{"type":"fixed","name":"F","size":1099511627776},"default":""}]}`,
+	for _, tc := range []struct {
+		schema string
+		want   string
+	}{
+		{`{"type":"fixed","name":"F","size":68719476736}`, "greater than the maximum"},
+		{`{"type":"fixed","name":"F","size":4294967296}`, "greater than the maximum"},
+		{`{"type":"fixed","name":"F","size":4294967312}`, "greater than the maximum"},
+		{`{"type":"fixed","name":"F","size":1.5}`, "must be an integer"},
+		{`{"type":"record","name":"R","fields":[{"name":"f",
+			"type":{"type":"fixed","name":"F","size":1099511627776},"default":""}]}`, "greater than the maximum"},
 	} {
-		_, err := avro.Parse(schema)
-		require.Error(t, err, "%s", schema)
-		assert.ErrorContains(t, err, "greater than the maximum", "%s", schema)
+		_, err := avro.Parse(tc.schema)
+		require.Error(t, err, "%s", tc.schema)
+		assert.ErrorContains(t, err, tc.want, "%s", tc.schema)
 	}
 
 	// A fixed still decodes into `any`.
@@ -1009,4 +1015,166 @@ func TestFix_MarshalledDefaultsParseBack(t *testing.T) {
 	for i, field := range want.Fields() {
 		assert.Equal(t, field.Default(), got.Fields()[i].Default(), "field %s", field.Name())
 	}
+}
+
+func TestFix_RecursiveRecordDefaultRejectedWithoutPanic(t *testing.T) {
+	_, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		{"name":"next","type":"R","default":{}}]}`)
+	require.Error(t, err)
+}
+
+func TestFix_RecordDefaultDoesNotInventMissingDefaults(t *testing.T) {
+	_, err := avro.Parse(`{
+		"type":"record","name":"Outer","fields":[{
+			"name":"inner",
+			"type":{"type":"record","name":"Inner","fields":[
+				{"name":"required","type":"null"},
+				{"name":"optional","type":["null","int"]}
+			]},
+			"default":{}
+		}]
+	}`)
+	require.Error(t, err)
+}
+
+func TestFix_FixedDefaultMustHaveDeclaredSize(t *testing.T) {
+	for _, def := range []string{`""`, `"a"`, `"abcd"`} {
+		in := `{"type":"record","name":"R","fields":[{
+			"name":"f","type":{"type":"fixed","name":"F","size":3},
+			"default":` + def + `}]}`
+		_, err := avro.Parse(in)
+		require.Error(t, err, "default %s", def)
+	}
+
+	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{
+		"name":"f","type":{"type":"fixed","name":"F","size":3},"default":"abc"}]}`)
+	require.NoError(t, err)
+	assert.Equal(t, [3]byte{'a', 'b', 'c'}, s.(*avro.RecordSchema).Fields()[0].Default())
+}
+
+func TestFix_NumericDefaultsAreExactAndRangeChecked(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int64
+	}{
+		{"9223372036854775807", math.MaxInt64},
+		{"9007199254740993", 9007199254740993},
+		{"1.5", 1},
+		{"-2147483648", -2147483648},
+	} {
+		in := `{"type":"record","name":"R","fields":[{"name":"n","type":"long","default":` + tc.value + `}]}`
+		s, err := avro.Parse(in)
+		require.NoError(t, err, "long default %s", tc.value)
+		assert.Equal(t, tc.want, s.(*avro.RecordSchema).Fields()[0].Default())
+	}
+
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{{"1.0", 1}, {"1e0", 1}, {"0e-100000", 0}} {
+		in := `{"type":"record","name":"R","fields":[{"name":"n","type":"int","default":` + tc.value + `}]}`
+		s, err := avro.Parse(in)
+		require.NoError(t, err, "int default %s", tc.value)
+		assert.Equal(t, tc.want, s.(*avro.RecordSchema).Fields()[0].Default(), "int default %s", tc.value)
+	}
+
+	for _, tc := range []struct{ typ, def string }{
+		{"int", "1.5"},
+		{"int", "1.0000000000000001"},
+		{"int", "1e-100000"},
+		{"int", "2147483648"},
+		{"long", "1e100"},
+		{"float", "3.4028236e38"},
+	} {
+		in := fmt.Sprintf(`{"type":"record","name":"R","fields":[
+			{"name":"n","type":%q,"default":%s}]}`, tc.typ, tc.def)
+		_, err := avro.Parse(in)
+		require.Error(t, err, "%s default %s", tc.typ, tc.def)
+	}
+}
+
+func TestFix_AliasCannotShadowDefinedName(t *testing.T) {
+	for _, namedType := range []string{"record", "enum", "fixed"} {
+		t.Run(namedType, func(t *testing.T) {
+			var definition string
+			switch namedType {
+			case "record":
+				definition = `{"type":"record","name":"S","aliases":["R"],"fields":[]}`
+			case "enum":
+				definition = `{"type":"enum","name":"S","aliases":["R"],"symbols":["A"]}`
+			case "fixed":
+				definition = `{"type":"fixed","name":"S","aliases":["R"],"size":1}`
+			}
+			_, err := avro.Parse(`{"type":"record","name":"Container","fields":[
+				{"name":"first","type":{"type":"record","name":"R","fields":[]}},
+				{"name":"second","type":` + definition + `},
+				{"name":"ref","type":"R"}
+			]}`)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestFix_AmbiguousReservedKeyCaseIsRejected(t *testing.T) {
+	_, err := avro.ParseWithCache(
+		`{"type":"record","Name":"R","NAME":"S","fields":[]}`,
+		"", &avro.SchemaCache{},
+	)
+	require.Error(t, err, "reserved keys must be matched case-sensitively")
+}
+
+func TestFix_EnumStringAllocationsAreBounded(t *testing.T) {
+	symbols := make([]string, 2000)
+	for i := range symbols {
+		symbols[i] = fmt.Sprintf("A%06d", i)
+	}
+	s, err := avro.NewEnumSchema("E", "", symbols)
+	require.NoError(t, err)
+
+	allocs := testing.AllocsPerRun(2, func() {
+		_ = s.String()
+	})
+	require.Less(t, allocs, float64(100), "canonicalization must not allocate once per symbol")
+}
+
+func TestFix_TruncatedFixedRecordDoesNotAmplifyAllocations(t *testing.T) {
+	var declaration bytes.Buffer
+	declaration.WriteString(`{"type":"record","name":"R","fields":[`)
+	for i := range 8 {
+		if i > 0 {
+			declaration.WriteByte(',')
+		}
+		fmt.Fprintf(&declaration, `{"name":"f%d","type":{"type":"fixed","name":"F%d","size":1048576}}`, i, i)
+	}
+	declaration.WriteString(`]}`)
+	schema := avro.MustParse(declaration.String())
+	cfg := avro.Config{DisableCaching: true}.Freeze()
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var got any
+	err := cfg.Unmarshal(schema, nil, &got)
+	runtime.ReadMemStats(&after)
+
+	require.Error(t, err)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	assert.Less(t, allocated, uint64(4<<20), "allocated %d bytes for empty input", allocated)
+}
+
+func TestFix_ResetClearsReaderAndWriterErrors(t *testing.T) {
+	r := avro.NewReader(nil, 0).Reset([]byte{0x80})
+	_ = r.ReadInt()
+	require.Error(t, r.Error)
+
+	r.Reset([]byte{0x02})
+	assert.Equal(t, int32(1), r.ReadInt())
+	require.NoError(t, r.Error)
+
+	w := avro.NewWriter(nil, 0)
+	w.Error = io.ErrUnexpectedEOF
+	w.Reset(nil)
+	require.NoError(t, w.Error)
+	w.WriteInt(1)
+	require.NoError(t, w.Error)
 }

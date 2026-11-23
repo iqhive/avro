@@ -75,6 +75,26 @@ func TestEncoder_UnionMapNull(t *testing.T) {
 	assert.Equal(t, []byte{0x00}, buf.Bytes())
 }
 
+func TestEncoder_UnionMapNil(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := avro.MustParse(`["null","long"]`)
+
+	t.Run("null branch", func(t *testing.T) {
+		got, err := avro.Marshal(schema, map[string]any{"null": nil})
+
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0x00}, got)
+	})
+
+	t.Run("non-null branch", func(t *testing.T) {
+		got, err := avro.Marshal(schema, map[string]any{"long": nil})
+
+		require.EqualError(t, err, `avro: cannot encode nil value for non-null union branch "long"`)
+		assert.Nil(t, got)
+	})
+}
+
 func TestEncoder_UnionMapMultipleEntries(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -516,6 +536,34 @@ func TestEncoder_NullableUnionConverterToAnyInterface(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []byte{0}, buf.Bytes())
+}
+
+type nilUnionConverter struct{}
+
+func (*nilUnionConverter) FromAny(any) error {
+	return nil
+}
+
+func (*nilUnionConverter) ToAny() (any, error) {
+	return nil, nil
+}
+
+func TestEncoder_UnionConverterToAnyNilNullable(t *testing.T) {
+	defer ConfigTeardown()
+
+	got, err := avro.Marshal(avro.MustParse(`["long","null"]`), &nilUnionConverter{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0x02}, got)
+}
+
+func TestEncoder_UnionConverterToAnyNilNonNullable(t *testing.T) {
+	defer ConfigTeardown()
+
+	got, err := avro.Marshal(avro.MustParse(`["long","string"]`), &nilUnionConverter{})
+
+	require.EqualError(t, err, "avro: unionConverterToAnyCodec: encoding nil value for non nillable union")
+	assert.Nil(t, got)
 }
 
 func TestEncoder_UnionInterfaceMap(t *testing.T) {

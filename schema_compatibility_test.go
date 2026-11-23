@@ -1,8 +1,11 @@
 package avro_test
 
 import (
+	"fmt"
 	"math/big"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -293,6 +296,107 @@ func TestSchemaCompatibility_CompatibleUsesCacheWithError(t *testing.T) {
 	err := sc.Compatible(r, w)
 
 	assert.Error(t, err)
+}
+
+func TestSchemaCompatibility_CompatibleDoesNotCacheDefaultSemanticsAcrossOperations(t *testing.T) {
+	withDefault := avro.MustParse(`{
+		"type": "record",
+		"name": "test",
+		"fields": [
+			{"name": "a", "type": "int"},
+			{"name": "b", "type": "string", "default": "test"}
+		]
+	}`)
+	withoutDefault := avro.MustParse(`{
+		"type": "record",
+		"name": "test",
+		"fields": [
+			{"name": "a", "type": "int"},
+			{"name": "b", "type": "string"}
+		]
+	}`)
+	writer := avro.MustParse(`{
+		"type": "record",
+		"name": "test",
+		"fields": [{"name": "a", "type": "int"}]
+	}`)
+
+	require.Equal(t, withDefault.Fingerprint(), withoutDefault.Fingerprint(),
+		"the regression requires canonical fingerprints that omit the field default")
+
+	t.Run("cached success does not hide a missing default", func(t *testing.T) {
+		sc := avro.NewSchemaCompatibility()
+		require.NoError(t, sc.Compatible(withDefault, writer))
+		assert.Error(t, sc.Compatible(withoutDefault, writer))
+	})
+
+	t.Run("cached failure does not reject a valid default", func(t *testing.T) {
+		sc := avro.NewSchemaCompatibility()
+		require.Error(t, sc.Compatible(withoutDefault, writer))
+		assert.NoError(t, sc.Compatible(withDefault, writer))
+	})
+}
+
+type compatibilityGatedSchema struct {
+	avro.Schema
+	entered chan struct{}
+	release chan struct{}
+	first   atomic.Bool
+}
+
+func (s *compatibilityGatedSchema) Type() avro.Type {
+	if s.first.CompareAndSwap(false, true) {
+		close(s.entered)
+		<-s.release
+	}
+	return s.Schema.Type()
+}
+
+func TestSchemaCompatibility_CompatibleDoesNotShareRecursionMarkersBetweenOperations(t *testing.T) {
+	sc := avro.NewSchemaCompatibility()
+	reader := avro.MustParse(`"string"`)
+	writer := &compatibilityGatedSchema{
+		Schema:  avro.MustParse(`"int"`),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(writer.release) })
+	}
+	defer release()
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- sc.Compatible(reader, writer)
+	}()
+
+	select {
+	case <-writer.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first compatibility operation did not reach the schema gate")
+	}
+
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- sc.Compatible(reader, writer)
+	}()
+
+	select {
+	case err := <-secondResult:
+		assert.Error(t, err, "a concurrent operation must not treat an in-progress marker as success")
+	case <-time.After(5 * time.Second):
+		t.Error("second compatibility operation did not return")
+	}
+
+	release()
+	select {
+	case err := <-firstResult:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Error("first compatibility operation did not return")
+	}
 }
 
 func TestSchemaCompatibility_Resolve(t *testing.T) {
@@ -1014,6 +1118,59 @@ func TestSchemaCompatibility_ResolveWithFieldMissingInWriterAndReaderStruct(t *t
 	assert.NoError(t, err)
 
 	assert.Equal(t, want, result)
+}
+
+func TestSchemaCompatibility_ResolveUnionPreservesWriterBranchPositions(t *testing.T) {
+	reader := avro.MustParse(`["long", "double"]`)
+	writer := avro.MustParse(`["int", "long"]`)
+
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+	require.NoError(t, err)
+
+	union, ok := resolved.(*avro.UnionSchema)
+	require.True(t, ok)
+	require.Len(t, union.Types(), 2)
+	assert.Equal(t, avro.Long, union.Types()[0].Type())
+	assert.Equal(t, avro.Long, union.Types()[1].Type())
+
+	tests := []struct {
+		name  string
+		value map[string]any
+		want  int64
+	}{
+		{name: "writer int branch", value: map[string]any{"int": int32(10)}, want: 10},
+		{name: "writer long branch", value: map[string]any{"long": int64(11)}, want: 11},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := avro.Marshal(writer, test.value)
+			require.NoError(t, err)
+
+			var got any
+			require.NoError(t, avro.Unmarshal(resolved, data, &got))
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestSchemaCompatibility_DifferentiatesExternalReferenceDefinitions(t *testing.T) {
+	parseItems := func(size int) avro.Schema {
+		container := avro.MustParse(fmt.Sprintf(`{
+			"type":"record","name":"Container","fields":[
+				{"name":"definition","type":{"type":"fixed","name":"T","size":%d}},
+				{"name":"items","type":{"type":"array","items":"T"}}
+			]
+		}`, size))
+		return container.(*avro.RecordSchema).Fields()[1].Type()
+	}
+
+	a := parseItems(8)
+	b := parseItems(16)
+	require.Equal(t, a.Fingerprint(), b.Fingerprint())
+
+	compat := avro.NewSchemaCompatibility()
+	require.NoError(t, compat.Compatible(a, a))
+	require.Error(t, compat.Compatible(a, b))
 }
 
 func TestSchemaCompatibility_ResolveWithEnums(t *testing.T) {

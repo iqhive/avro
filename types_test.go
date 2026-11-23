@@ -1,6 +1,14 @@
 package avro_test
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+
+	"github.com/iqhive/avro/v2"
+	"github.com/modern-go/reflect2"
+)
 
 type TestInterface interface {
 	SomeFunc() int
@@ -88,4 +96,66 @@ type TestEmbeddedIntRecord struct {
 type TestUnexportedRecord struct {
 	A int64  `avro:"a"`
 	b string `avro:"b"`
+}
+
+func TestTypeResolverRegisterConcurrent(t *testing.T) {
+	const registrations = 1000
+
+	resolver := avro.NewTypeResolver()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(registrations)
+
+	for i := range registrations {
+		go func() {
+			defer wg.Done()
+			<-start
+			resolver.Register(fmt.Sprintf("test.%d", i), TestRecord{})
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	names, err := resolver.Name(reflect2.TypeOf(TestRecord{}))
+	if err != nil {
+		t.Fatalf("resolve registered type: %v", err)
+	}
+	if len(names) != registrations {
+		t.Fatalf("got %d names, want %d", len(names), registrations)
+	}
+
+	seen := make(map[string]struct{}, registrations)
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			t.Fatalf("duplicate name %q", name)
+		}
+		seen[name] = struct{}{}
+	}
+	for i := range registrations {
+		name := fmt.Sprintf("test.%d", i)
+		if _, ok := seen[name]; !ok {
+			t.Errorf("missing name %q", name)
+		}
+	}
+}
+
+func TestTypeResolverNameReturnsClone(t *testing.T) {
+	resolver := avro.NewTypeResolver()
+	resolver.Register("test", TestRecord{})
+	typ := reflect2.TypeOf(TestRecord{})
+
+	names, err := resolver.Name(typ)
+	if err != nil {
+		t.Fatalf("resolve registered type: %v", err)
+	}
+	names[0] = "mutated"
+
+	names, err = resolver.Name(typ)
+	if err != nil {
+		t.Fatalf("resolve registered type after caller mutation: %v", err)
+	}
+	if names[0] != "test" {
+		t.Fatalf("caller mutation changed stored name to %q", names[0])
+	}
 }

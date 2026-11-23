@@ -238,6 +238,15 @@ func TestReader_ReadNext(t *testing.T) {
 	}
 }
 
+func TestReader_ReadNextNull(t *testing.T) {
+	r := avro.NewReader(nil, 0).Reset(nil)
+
+	got := r.ReadNext(avro.MustParse(`"null"`))
+
+	assert.Nil(t, got)
+	require.NoError(t, r.Error)
+}
+
 func TestReader_ReadNextUnsupportedType(t *testing.T) {
 	schema := avro.NewPrimitiveSchema(avro.Type("test"), nil)
 	r := avro.NewReader(bytes.NewReader([]byte{0x01}), 10)
@@ -275,6 +284,55 @@ func TestReader_ReadArrayCB_StopsOnError(t *testing.T) {
 
 	assert.Equal(t, 1, callbackCalls)
 	require.ErrorContains(t, r.Error, "stop")
+}
+
+func TestReader_ReadNextHonoursCollectionAllocationLimits(t *testing.T) {
+	data := []byte{0xc8, 0x01, 0x00} // 100 entries, then end of blocks.
+
+	t.Run("array", func(t *testing.T) {
+		schema := avro.MustParse(`{"type":"array","items":{"type":"fixed","name":"F","size":0}}`)
+		cfg := avro.Config{MaxSliceAllocSize: 10}.Freeze()
+		r := avro.NewReader(nil, 0, avro.WithReaderConfig(cfg)).Reset(data)
+
+		_ = r.ReadNext(schema)
+		require.ErrorContains(t, r.Error, "MaxSliceAllocSize")
+	})
+
+	t.Run("map", func(t *testing.T) {
+		schema := avro.MustParse(`{"type":"map","values":"null"}`)
+		cfg := avro.Config{MaxMapAllocSize: 10}.Freeze()
+		r := avro.NewReader(nil, 0, avro.WithReaderConfig(cfg)).Reset(data)
+
+		_ = r.ReadNext(schema)
+		require.ErrorContains(t, r.Error, "MaxMapAllocSize")
+	})
+}
+
+func TestReader_ReadArrayCB_StopsWhenCallbackReturnsFalse(t *testing.T) {
+	r := avro.NewReader(nil, 0).Reset([]byte{0x72}) // Block count = 57.
+	calls := 0
+
+	r.ReadArrayCB(func(*avro.Reader) bool {
+		calls++
+		return false
+	})
+
+	assert.Equal(t, 1, calls)
+	require.NoError(t, r.Error)
+}
+
+func TestReader_ReadMapCB_StopsWhenCallbackReturnsFalse(t *testing.T) {
+	r := avro.NewReader(nil, 0).Reset([]byte{0x72, 0x02, 'k'}) // Block count = 57, key = "k".
+	calls := 0
+
+	r.ReadMapCB(func(_ *avro.Reader, field string) bool {
+		calls++
+		assert.Equal(t, "k", field)
+		return false
+	})
+
+	assert.Equal(t, 1, calls)
+	require.NoError(t, r.Error)
 }
 
 // On 32-bit, int(1<<32) truncates to 0 and would silently select types[0]

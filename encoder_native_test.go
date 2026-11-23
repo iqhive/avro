@@ -417,6 +417,26 @@ func TestEncoder_Time_Date(t *testing.T) {
 	assert.Equal(t, []byte{0xCA, 0xAD, 0x2A}, buf.Bytes())
 }
 
+func TestEncoder_Time_DateOverflow(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := `{"type":"int","logicalType":"date"}`
+	for _, value := range []time.Time{
+		time.Date(6_000_000, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(-6_000_000, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		buf := bytes.NewBuffer(nil)
+		enc, err := avro.NewEncoder(schema, buf)
+		require.NoError(t, err)
+
+		err = enc.Encode(value)
+
+		require.Error(t, err, "date must not wrap its day count to int32")
+		assert.Contains(t, err.Error(), "out of range")
+		assert.Empty(t, buf.Bytes())
+	}
+}
+
 func TestEncoder_Time_TimestampMillis(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -1031,6 +1051,26 @@ func TestEncoder_Duration_TimeMillis(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []byte{0xAA, 0xB4, 0xDE, 0x75}, buf.Bytes())
+}
+
+func TestEncoder_Duration_TimeMillisOverflow(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := `{"type":"int","logicalType":"time-millis"}`
+	for _, value := range []time.Duration{
+		(1<<31 + 1) * time.Millisecond,
+		-(1<<31 + 1) * time.Millisecond,
+	} {
+		buf := bytes.NewBuffer(nil)
+		enc, err := avro.NewEncoder(schema, buf)
+		require.NoError(t, err)
+
+		err = enc.Encode(value)
+
+		require.Error(t, err, "duration must not wrap milliseconds to int32")
+		assert.Contains(t, err.Error(), "out of range")
+		assert.Empty(t, buf.Bytes())
+	}
 }
 
 func TestEncoder_Duration_TimeMicros(t *testing.T) {
