@@ -23,69 +23,42 @@ This is iqhive's fork of [hamba/avro](https://github.com/hamba/avro), which was 
 
 Fixed in iqhive/avro (each has a regression test, most in `fork_fixes_test.go`):
 
-- **Memory safety:** a union decoded into a struct held by value, or into a value-held `UnionConverter`, wrote through
-  the struct's first field as a pointer; a `null` into a reused slice left its length over a nil array; a union decoded
-  into `any` through a registered pointer type stored a pointer where the garbage collector does not look for one; a
-  type converter's result was stored unchecked; and the encoder read a struct under a bytes decimal schema as a
-  `big.Rat`, past its end.
-- **Crashes:** deeply nested data for a recursive schema, a Go value that refers to itself, `type P *P`, and resolving a
-  recursive schema overflowed the goroutine stack (a fatal error). Records may now nest `Config.MaxDepth` deep
-  (default 10000). Encoding a nil `*big.Rat`, a missing field whose union default is `null`, and `Unmarshal` into
-  `nil` panicked, as did a `UnionConverter` whose `ToAny` returned nil or a nil pointer. `Config.MaxDepth` counted
-  records only, so a recursive schema with arrays or maps between its records still overflowed the stack; records,
-  arrays and maps now each count as a level, so a tree whose records hold their children in an array or a map nests
-  5000 records deep at the default.
-- **Denial of service:** array and map block counts no longer drive allocation before the data is read, and a map
-  with `TextUnmarshaler` keys stops at the first error. A `fixed` schema could declare any size and the library
-  allocated it (decoding into `any` made the array before a byte of data was read, and parsing a field default
-  made it from the schema alone), so a sixty-byte schema from an untrusted OCF header or schema registry could
-  demand a terabyte; sizes are now capped at 16 MiB. A `bytes` or `fixed` decimal could declare any precision,
-  and each decoded value computed 10^scale and kept it as its denominator, so a schema with scale 999999999
-  spent unbounded time and memory on every value; precision is now capped at 1000, the most PostgreSQL's numeric
-  accepts, and a scale past the cap is refused even in a schema built in Go. After a read error, a union decoded
-  its first branch: under a record that refers to itself, an empty body walked the schema to `Config.MaxDepth`
-  and took seconds and gigabytes to report the error. An array of elements that take no bytes (`null`, an empty
-  record, a `fixed` of size 0) made the decoder allocate without bound from five bytes, and skipping one spun for
-  centuries on eleven. A value may now hold 8 such elements for each of its own bytes, plus a slack of 1024 that
-  the values of one `Unmarshal`, one `Decoder`'s stream or one OCF block share (`Config.MaxSliceAllocSize` can
-  lower the 1024, not raise it). This library writes such arrays in blocks of at most 8, so its own output always
-  reads back; a single block of N of them, as Java and Python write an array, reads back as a value of its own up
-  to N = 1040. A skip passes over a block of them in one step. An OCF block of records that take no bytes may
-  claim as many as such an array may hold: a 120-byte file could claim 2^62 empty records. An error deep in
-  nested data collected a field name or type at every level, each level copying the message below it, so 9999
-  bytes nested 9998 deep took 1.7 s and 2.5 GB to fail; an error now keeps the 32 levels nearest its cause, after
-  a `...` that marks the cut.
-- **Silent data loss:** truncated input was decoded without error; integers that do not fit the Go or Avro type were
-  wrapped; a `big.Rat` value decoded as 0; reused slices, maps, unions and converters kept the previous message's
-  values, and a reused map decoded the value of a key it already held into the value held there, so a nested map, a
-  slice or a field the schema does not name kept the previous message's content;
-  appending to a decoded `[]byte` overwrote the values decoded after it; pre-1970 dates with a time of day
-  were a day late; negative decimals rounded away from zero; fixed decimals accepted a precision their size cannot
-  hold; defaults that failed to decode were dropped; encoders were cached without regard to field defaults; and
-  numeric defaults went through float64, in schemas and in protocols, so a long default of Long.MAX_VALUE read as
-  Long.MIN_VALUE and one above 2^53 lost its last digits. Decoders were cached without regard to field aliases or
-  an enum's default, so a schema that differed only there reused another's decoder, which skipped the aliased
-  field or read the other enum default. `Decoder.Decode` returned `io.EOF` when its reader failed between values,
-  so a reset connection read as a complete stream. An OCF block holding fewer records than its count read as the
-  end of the file. `gen` and `avrogen` turned two records (or enums) with one short name in different namespaces
-  into one Go type, and the second's fields were skipped on every decode; they now fail and name both. Skipping a
-  field of a resolved schema that the Go struct lacks read it in the reader's shape, so a reader-only field with a
-  default, or an int or long read as a float or double, misread the fields after it; such a field is now skipped
-  as the writer wrote it.
-- **Schema registry client:** a subject was put into the request path unescaped, so one holding `/`, `?`, `#` or `..`
-  reached another endpoint (`DeleteSubject("../config")` sent a DELETE for `/config`, the global configuration), and a message whose
-  payload encodes to no bytes was refused as too short.
-- **Single-object encoding:** the decoders and the memory schema store took only the fingerprint this library
-  writes, which is taken over a form that keeps logical types, so for a schema with a logical type they refused the
-  bodies Java writes, fingerprinted over the Parsing Canonical Form as its SchemaNormalization computes it. Both
-  fingerprints are accepted now; the one written is unchanged. (Python's avro and goavro write a primitive with a
-  logical type as `{"type":"long"}` in that form, so their fingerprint for such a schema is still refused.)
-- **Other:** an int or long varint with bits past the type's width read as a different, wrapped value (and `ReadNext`
-  disagreed with the decoders about such a union branch); skipping a `null` field failed; skipping accepted over-long
-  varints; a map record's union default was looked up by type instead of name; and the fixed-to-`uint64` codec raced
-  under concurrent use. A reader error inside a string, bytes, fixed, float, double or boolean was reported as
-  `io.ErrUnexpectedEOF`, truncated input. The OCF decoder could not read records that take no bytes, and data left
-  in a block after its last record was read as the next block's first record; it is now an error, as in Java.
+- **Memory safety**
+  - A union decoded into a value-held struct or `UnionConverter` wrote through the struct's first field as a pointer.
+  - A `null` decoded into a reused slice left its length over a nil array.
+  - A union decoded into `any` through a registered pointer type hid a pointer from the garbage collector.
+  - Type converter results were stored unchecked.
+  - The encoder read a struct under a bytes decimal schema as a `big.Rat`, past its end.
+- **Crashes**
+  - Deep data for a recursive schema, a self-referential Go value, `type P *P` and recursive schema resolution overflowed the stack. `Config.MaxDepth` (default 10000) now bounds records, arrays and maps.
+  - Encoding a nil `*big.Rat` or a missing field with a `null` union default, `Unmarshal` into `nil`, and a `UnionConverter` whose `ToAny` returned nil all panicked.
+- **Denial of service**
+  - Array and map block counts no longer drive allocation before the data arrives, and a map with `TextUnmarshaler` keys stops at its first error.
+  - `fixed` sizes are capped at 16 MiB and decimal precision at 1000, PostgreSQL's maximum. A hostile schema could demand a terabyte, or unbounded work for every value.
+  - After a read error, a union no longer decodes its first branch, which could walk a recursive schema all the way to `Config.MaxDepth`.
+  - Arrays of elements that take no bytes (`null`, empty records, zero-size `fixed`) could allocate without bound from five bytes, and skipping one could spin for centuries. A value may now hold 8 per byte plus a shared slack of 1024; this library writes them in blocks of at most 8, and a Java or Python block reads back up to 1040.
+  - OCF blocks of records that take no bytes are bounded the same way.
+  - An error in deeply nested data keeps only the 32 levels nearest its cause, instead of copying the message at every level.
+- **Silent data loss**
+  - Truncated input decoded without error, oversized integers wrapped, and `big.Rat` values decoded as 0.
+  - Reused slices, maps, unions and converters kept the previous message's values.
+  - Appending to a decoded `[]byte` overwrote the values decoded after it.
+  - Pre-1970 dates with a time of day were a day late, negative decimals rounded away from zero, and fixed decimals accepted a precision their size cannot hold.
+  - Defaults that failed to decode were dropped, and numeric defaults went through float64, which corrupted large longs.
+  - Codecs were cached without regard to field defaults, aliases or enum defaults, so schemas differing only there shared the wrong codec.
+  - `Decoder.Decode` returned `io.EOF` when its reader failed between values, and an OCF block with fewer records than it claimed read as the end of the file.
+  - `gen` and `avrogen` merged records or enums sharing a short name across namespaces; they now fail.
+  - Under schema resolution, a field missing from the Go struct was skipped in the reader's shape, misreading the fields after it.
+- **Schema registry client**
+  - Subjects were not escaped in request paths, so `DeleteSubject("../config")` hit the global configuration. Empty payloads were refused as too short.
+- **Single-object encoding**
+  - The decoders and the memory schema store now also accept Java's fingerprint for schemas with logical types. The fingerprint written is unchanged.
+- **Other**
+  - Varints with bits past the type's width read as wrapped values, and skipping accepted over-long varints.
+  - Skipping a `null` field failed, and a map record's union default was looked up by type instead of name.
+  - The fixed-to-`uint64` codec raced under concurrent use.
+  - Reader errors inside a string, bytes, fixed, float, double or boolean were reported as truncated input.
+  - The OCF decoder could not read records that take no bytes, and data left after a block's last record is now an error, as in Java.
 
 ## Why this fork?
 
